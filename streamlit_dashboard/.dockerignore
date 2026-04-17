@@ -1,0 +1,57 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+*/.venv/
+*/venv/
+*/env/
+
+# Streamlit config
+.streamlit/
+
+# Output folders
+output/
+Output/
+archive/
+
+# Raw data
+Data/
+data/
+*.csv
+*.xlsx
+*.zip
+*.npy
+*.npz
+
+# Plots and generated images
+*.png
+*.pdf
+
+# macOS junk
+.DS_Store
+
+# VSCode + IDE configs
+.vscode/
+.idea/
+
+# Docker artifacts
+docker-data/
+*.tar
+*.gz
+
+# Git files should not be sent
+.git/
+.gitignore
+
+# Personal / temp files
+*.tmp
+*.bak
+*~
+things to correct.txt
+workfile.md

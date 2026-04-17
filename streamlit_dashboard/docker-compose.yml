@@ -1,0 +1,8 @@
+version: "3.9"
+
+services:
+  streamlit:
+    build: .
+    container_name: sbmi-streamlit
+    ports:
+      - "8501:8501"

@@ -1,0 +1,16 @@
+FA:
+
+remove .ser from file names and data
+
+correct number of spins in substrate_N_D column should be the same number of elements as in substrate ppm
+
+
+For developers
+Handle the cases where no metabolite 1 is assigned, in this case fit only substrate and HDO signals for example alanine-d3 case
+
+Handle the case when substrate is HDO, so in this case only one signal should be fitted
+
+
+for reference one should use substrate_mM not the substrate_mM_added
+Added one is before dilution 
+needed for experiment description and not for analysis
