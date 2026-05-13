@@ -5,6 +5,16 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import io
+import nmrglue as ng
+import numpy as np
+from scipy.signal import find_peaks
+import sys
+import ctypes
+import tkinter as tk
+from tkinter import TclError
+from tkinter import filedialog
+
 from LoadData import *
 from Process4Panels import Process4Panels
 from panel1_spectrum_plot import Panel1SpectrumPlot
@@ -28,6 +38,56 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+def process_to_dataframe(pdata_path: Path) -> pd.DataFrame:
+    """Read Bruker pdata/1 and return the cropped DataFrame (ppm + active cols)."""
+    dic, data = ng.bruker.read_pdata(str(pdata_path))
+    udic = ng.bruker.guess_udic(dic, data)
+    uc = ng.fileiobase.uc_from_udic(udic, dim=1)
+    ppm = uc.ppm_scale()
+
+    df = pd.DataFrame(data.T)
+    df.insert(0, "ppm", ppm)
+    df = df.sort_values("ppm", ascending=True)
+
+    # Keep only active spectra columns and match the notebook downsampling behavior.
+    spectra = df.iloc[:, 1:]
+    mask = spectra.abs().max(axis=0) > 1e6
+    df = pd.concat([df["ppm"], spectra.loc[:, mask]], axis=1)
+    df = df.iloc[1::2, :].reset_index(drop=True)
+
+    scale_factor = 32000
+    df.loc[:, df.columns != "ppm"] = df.loc[:, df.columns != "ppm"] / scale_factor
+
+    # Rename ppm column to match the expected name in the notebook
+    df.rename(columns={df.columns[0]: "2H chemical shift (ppm)"}, inplace=True)
+
+    # Align first frame to 4.7 ppm.
+    ppm_vals = df.iloc[:, 0].values
+    first = df.iloc[:, 1].to_numpy()
+    peaks, _ = find_peaks(first, prominence=np.std(first))
+    if len(peaks) == 0:
+        peaks, _ = find_peaks(first)
+    if len(peaks) == 0:
+        raise ValueError("No peaks detected for alignment")
+    closest = peaks[np.argmin(np.abs(ppm_vals[peaks] - 4.7))]
+    df["2H chemical shift (ppm)"] = df["2H chemical shift (ppm)"] + (4.7 - ppm_vals[closest])
+
+    # Crop to the detected peak region from the mean spectrum.
+    area_around = 0.5
+    ppm_vals = df.iloc[:, 0].values
+    mean_spec = df.iloc[:, 1:].mean(axis=1).values
+    peaks, _ = find_peaks(
+        mean_spec,
+        prominence=np.std(mean_spec) * 2,
+        height=np.mean(mean_spec) + 1.5 * np.std(mean_spec),
+    )
+    if len(peaks) == 0:
+        raise ValueError("No peaks detected in mean spectrum")
+    pppm = ppm_vals[peaks]
+    low, high = pppm.min() - area_around, pppm.max() + area_around
+    mask_range = (ppm_vals >= low) & (ppm_vals <= high)
+    return df.loc[mask_range].reset_index(drop=True)
+
 
 class StreamlitApp:
     def __init__(self, fig1=None, fig2=None, fig3=None, fig4=None):
@@ -35,6 +95,68 @@ class StreamlitApp:
         self.fig2 = fig2
         self.fig3 = fig3
         self.fig4 = fig4
+
+    def _pick_folder(self, title):
+        if sys.platform == "win32":
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            except Exception:
+                try:
+                    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+                except Exception:
+                    try:
+                        ctypes.windll.user32.SetProcessDPIAware()
+                    except Exception:
+                        pass
+
+        root = None
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            folder = filedialog.askdirectory(title=title)
+            return Path(folder) if folder else None
+        except (TclError, RuntimeError, OSError) as exc:
+            st.warning(f"Could not open system folder picker. You can paste the folder path manually. Details: {exc}")
+            return None
+        finally:
+            if root is not None:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+
+    def _find_bruker_pdata(self, selected_folder):
+        selected_folder = Path(selected_folder)
+
+        direct_candidates = [
+            selected_folder,
+            selected_folder / "pdata" / "1",
+            selected_folder / "1",
+        ]
+        for candidate in direct_candidates:
+            if candidate.exists() and candidate.is_dir() and candidate.name == "1" and candidate.parent.name == "pdata":
+                return candidate
+
+        for candidate in selected_folder.rglob("1"):
+            if candidate.is_dir() and candidate.parent.name == "pdata":
+                return candidate
+
+        return None
+
+
+    def _prepare_bruker_input(self, selected_folder):
+        pdata_path = self._find_bruker_pdata(selected_folder)
+        if pdata_path is None:
+            raise ValueError("Could not find a Bruker pdata/1 folder in the selected directory.")
+
+        bruker_df = process_to_dataframe(pdata_path)
+        csv_buffer = io.BytesIO(bruker_df.to_csv(index=False).encode("utf-8"))
+        run_name = pdata_path.parent.parent.name if pdata_path.parent.parent.name else Path(selected_folder).name
+        sample_name = pdata_path.parent.parent.parent.name if pdata_path.parent.parent.parent.name else Path(selected_folder).name
+        source_name = f"{sample_name}_{run_name}"
+        csv_buffer.name = f"{source_name}.csv"
+        return csv_buffer, pdata_path
 
     def header(self):
         st.markdown("""<h1 style="text-align: center;">SBMI - Application</h1>""", unsafe_allow_html=True)
@@ -55,13 +177,22 @@ class StreamlitApp:
                 st.session_state["Model 1"] = False
                 st.session_state["Model 2"] = True
 
+            input_options = ["CSV", "Bruker"]
+            input_source = st.selectbox("Choose input type:", input_options)
+            st.session_state["input_source"] = input_source
+
             st.divider()
 
-            batch_mode = st.checkbox(
-                "Batch Processing Mode",
-                value=False,
-                help="Process multiple CSV files at once"
-            )
+            if input_source == "CSV":
+                batch_mode = st.checkbox(
+                    "Batch Processing Mode",
+                    value=False,
+                    help="Process multiple CSV files at once"
+                )
+            else:
+                batch_mode = False
+                st.session_state["batch_mode"] = False
+                st.info("Bruker input is converted to CSV and processed as a single dataset.")
             st.session_state["batch_mode"] = batch_mode
 
             sub_col1, sub_col2 = st.columns([0.30, 0.70])
@@ -70,23 +201,55 @@ class StreamlitApp:
                 st.markdown("**Step 1: Select the Metadata as .xlsx**")
                 self.meta_fp = st.file_uploader("Step 1: Upload Metadata (.xlsx)", type=["xlsx"], key="meta_file")
 
-                if not batch_mode:
-                    st.markdown("**Step 2: Select Spectrum as .csv**")
-                    self.data_fp = st.file_uploader("Step 2: Upload Spectrum (.csv)", type=["csv"], key="spectrum_file")
-                    self.data_files = [self.data_fp] if self.data_fp else []
-                else:
-                    st.markdown("**Step 2: Select Multiple Spectra as .csv**")
-                    uploaded_files = st.file_uploader(
-                        "Upload multiple Spectrum files (.csv)",
-                        type=["csv"],
-                        accept_multiple_files=True,
-                        key="spectrum_files_batch"
-                    )
-                    self.data_files = uploaded_files if uploaded_files else []
-                    self.data_fp = None
+# Select the Spectrum as csv 
+                if input_source == "CSV":
+                    if not batch_mode:
+                        st.markdown('**Step 2: Select Spectrum as .csv**')
+                        self.data_fp = st.file_uploader("Step 2: Upload Spectrum (.csv)", type=["csv"], key="spectrum_file")
+                        self.data_files = [self.data_fp] if self.data_fp else []
 
-                    if self.data_files:
-                        st.info(f"📁 {len(self.data_files)} files selected")
+                    else:
+                    # BATCH MODE - Multiple Files
+                        st.markdown('**Step 2: Select Multiple Spectra as .csv**')
+                        uploaded_files = st.file_uploader(
+                            "Upload multiple Spectrum files (.csv)",
+                            type=["csv"],
+                            accept_multiple_files=True,
+                            key="spectrum_files_batch"
+                        )
+                        self.data_files = uploaded_files if uploaded_files else []
+                        self.data_fp = None  
+                        
+                        if self.data_files:
+                            st.info(f"📁 {len(self.data_files)} files selected")
+                else:
+                    st.markdown('**Step 2: Select a Bruker folder**')
+                    if st.button("Choose Bruker folder", key="choose_bruker_folder"):
+                        selected_folder = self._pick_folder("Select the Bruker pdata/1 folder")
+                        if selected_folder is not None:
+                            try:
+                                bruker_buffer, bruker_pdata_path = self._prepare_bruker_input(selected_folder)
+                                st.session_state["bruker_selected_folder"] = str(selected_folder)
+                                st.session_state["bruker_pdata_path"] = str(bruker_pdata_path)
+                                st.session_state["bruker_csv_bytes"] = bruker_buffer.getvalue()
+                                st.session_state["bruker_csv_name"] = bruker_buffer.name
+                            except Exception as exc:
+                                st.session_state.pop("bruker_csv_bytes", None)
+                                st.session_state.pop("bruker_csv_name", None)
+                                st.session_state.pop("bruker_selected_folder", None)
+                                st.session_state.pop("bruker_pdata_path", None)
+                                st.error(f"Bruker conversion failed: {exc}")
+
+                    if st.session_state.get("bruker_csv_bytes"):
+                        self.data_fp = io.BytesIO(st.session_state["bruker_csv_bytes"])
+                        self.data_fp.name = st.session_state.get("bruker_csv_name", "bruker.csv")
+                        self.data_files = [self.data_fp]
+                        st.success(f"Bruker folder selected: {st.session_state.get('bruker_selected_folder', '')}")
+                        st.info(f"Converted file: {self.data_fp.name}")
+                    else:
+                        self.data_fp = None
+                        self.data_files = []
+                        st.warning("No Bruker folder selected yet.")
 
                 apply_reference = st.checkbox(
                     "Apply signal referencing (optional)",
