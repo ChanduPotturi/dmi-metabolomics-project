@@ -1,5 +1,6 @@
 import pandas as pd
 import os
+import re
 import numpy as np
 from scipy.optimize import curve_fit
 from copy import deepcopy
@@ -149,15 +150,20 @@ class PeakFitting:
                 names: list of corresponding peak labels
         """
 
+        def _normalize_file_name(value):
+            text = str(value).strip().lower()
+            # Treat "name _7.csv" and "name_7.csv" as the same file.
+            text = re.sub(r"\s+_", "_", text)
+            return text
+
         # Standardization of filter names
-        filename_base = os.path.splitext(self.file_name)[0].strip().lower()
+        filename_base = _normalize_file_name(os.path.splitext(self.file_name)[0])
 
-        # Standardize capitalization and spacing
-        self.meta_df["File"] = self.meta_df["File"].astype(str).str.strip().str.lower()
-
-        # Filter by file name
-        filtered = self.meta_df[self.meta_df["File"].str.contains(filename_base, na=False)]
-
+         # Handle both metadata formats
+        file_col = "File_Name_for_CSV" if "File_Name_for_CSV" in self.meta_df.columns else "File"
+        self.meta_df[file_col] = self.meta_df[file_col].astype(str).map(_normalize_file_name)
+        filtered = self.meta_df[self.meta_df[file_col].str.contains(filename_base, na=False)]
+        
         # If no line was found:
         if filtered.empty:
             st.warning(f"No metadata found for file '{self.file_name}'. Only water peak will be fitted.")

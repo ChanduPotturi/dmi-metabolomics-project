@@ -1,5 +1,6 @@
 import pandas as pd
 import os
+import re
 import numpy as np
 from scipy.optimize import curve_fit
 from copy import deepcopy
@@ -169,7 +170,16 @@ class PeakFitting:
             names: list of all names of the ppm values
         """
 
-        self.meta_df = self.meta_df[self.meta_df['File'].astype(str).str.upper() == str(self.file_name).upper()]
+        def _normalize_file_name(value):
+            text = str(value).strip().lower()
+            # Treat "name _7.csv" and "name_7.csv" as the same file.
+            text = re.sub(r"\s+_", "_", text)
+            return text
+
+        normalized_file_name = _normalize_file_name(self.file_name)
+        self.meta_df = self.meta_df[
+            self.meta_df['File'].astype(str).map(_normalize_file_name) == normalized_file_name
+        ]
 
         if self.meta_df.empty:
             print(f"No metadata found for {self.file_name}")
