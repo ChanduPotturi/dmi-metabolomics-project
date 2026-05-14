@@ -5,16 +5,6 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-import io
-import nmrglue as ng
-import numpy as np
-from scipy.signal import find_peaks
-import sys
-import ctypes
-import tkinter as tk
-from tkinter import TclError
-from tkinter import filedialog
-
 from LoadData import *
 from Process4Panels import Process4Panels
 from panel1_spectrum_plot import Panel1SpectrumPlot
@@ -38,56 +28,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-def process_to_dataframe(pdata_path: Path) -> pd.DataFrame:
-    """Read Bruker pdata/1 and return the cropped DataFrame (ppm + active cols)."""
-    dic, data = ng.bruker.read_pdata(str(pdata_path))
-    udic = ng.bruker.guess_udic(dic, data)
-    uc = ng.fileiobase.uc_from_udic(udic, dim=1)
-    ppm = uc.ppm_scale()
-
-    df = pd.DataFrame(data.T)
-    df.insert(0, "ppm", ppm)
-    df = df.sort_values("ppm", ascending=True)
-
-    # Keep only active spectra columns and match the notebook downsampling behavior.
-    spectra = df.iloc[:, 1:]
-    mask = spectra.abs().max(axis=0) > 1e6
-    df = pd.concat([df["ppm"], spectra.loc[:, mask]], axis=1)
-    df = df.iloc[1::2, :].reset_index(drop=True)
-
-    scale_factor = 32000
-    df.loc[:, df.columns != "ppm"] = df.loc[:, df.columns != "ppm"] / scale_factor
-
-    # Rename ppm column to match the expected name in the notebook
-    df.rename(columns={df.columns[0]: "2H chemical shift (ppm)"}, inplace=True)
-
-    # Align first frame to 4.7 ppm.
-    ppm_vals = df.iloc[:, 0].values
-    first = df.iloc[:, 1].to_numpy()
-    peaks, _ = find_peaks(first, prominence=np.std(first))
-    if len(peaks) == 0:
-        peaks, _ = find_peaks(first)
-    if len(peaks) == 0:
-        raise ValueError("No peaks detected for alignment")
-    closest = peaks[np.argmin(np.abs(ppm_vals[peaks] - 4.7))]
-    df["2H chemical shift (ppm)"] = df["2H chemical shift (ppm)"] + (4.7 - ppm_vals[closest])
-
-    # Crop to the detected peak region from the mean spectrum.
-    area_around = 0.5
-    ppm_vals = df.iloc[:, 0].values
-    mean_spec = df.iloc[:, 1:].mean(axis=1).values
-    peaks, _ = find_peaks(
-        mean_spec,
-        prominence=np.std(mean_spec) * 2,
-        height=np.mean(mean_spec) + 1.5 * np.std(mean_spec),
-    )
-    if len(peaks) == 0:
-        raise ValueError("No peaks detected in mean spectrum")
-    pppm = ppm_vals[peaks]
-    low, high = pppm.min() - area_around, pppm.max() + area_around
-    mask_range = (ppm_vals >= low) & (ppm_vals <= high)
-    return df.loc[mask_range].reset_index(drop=True)
-
 
 class StreamlitApp:
     def __init__(self, fig1=None, fig2=None, fig3=None, fig4=None):
@@ -95,68 +35,6 @@ class StreamlitApp:
         self.fig2 = fig2
         self.fig3 = fig3
         self.fig4 = fig4
-
-    def _pick_folder(self, title):
-        if sys.platform == "win32":
-            try:
-                ctypes.windll.shcore.SetProcessDpiAwareness(2)
-            except Exception:
-                try:
-                    ctypes.windll.shcore.SetProcessDpiAwareness(1)
-                except Exception:
-                    try:
-                        ctypes.windll.user32.SetProcessDPIAware()
-                    except Exception:
-                        pass
-
-        root = None
-        try:
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            folder = filedialog.askdirectory(title=title)
-            return Path(folder) if folder else None
-        except (TclError, RuntimeError, OSError) as exc:
-            st.warning(f"Could not open system folder picker. You can paste the folder path manually. Details: {exc}")
-            return None
-        finally:
-            if root is not None:
-                try:
-                    root.destroy()
-                except Exception:
-                    pass
-
-    def _find_bruker_pdata(self, selected_folder):
-        selected_folder = Path(selected_folder)
-
-        direct_candidates = [
-            selected_folder,
-            selected_folder / "pdata" / "1",
-            selected_folder / "1",
-        ]
-        for candidate in direct_candidates:
-            if candidate.exists() and candidate.is_dir() and candidate.name == "1" and candidate.parent.name == "pdata":
-                return candidate
-
-        for candidate in selected_folder.rglob("1"):
-            if candidate.is_dir() and candidate.parent.name == "pdata":
-                return candidate
-
-        return None
-
-
-    def _prepare_bruker_input(self, selected_folder):
-        pdata_path = self._find_bruker_pdata(selected_folder)
-        if pdata_path is None:
-            raise ValueError("Could not find a Bruker pdata/1 folder in the selected directory.")
-
-        bruker_df = process_to_dataframe(pdata_path)
-        csv_buffer = io.BytesIO(bruker_df.to_csv(index=False).encode("utf-8"))
-        run_name = pdata_path.parent.parent.name if pdata_path.parent.parent.name else Path(selected_folder).name
-        sample_name = pdata_path.parent.parent.parent.name if pdata_path.parent.parent.parent.name else Path(selected_folder).name
-        source_name = f"{sample_name}_{run_name}"
-        csv_buffer.name = f"{source_name}.csv"
-        return csv_buffer, pdata_path
 
     def header(self):
         st.markdown("""<h1 style="text-align: center;">SBMI - Application</h1>""", unsafe_allow_html=True)
@@ -177,79 +55,46 @@ class StreamlitApp:
                 st.session_state["Model 1"] = False
                 st.session_state["Model 2"] = True
 
-            input_options = ["CSV", "Bruker"]
-            input_source = st.selectbox("Choose input type:", input_options)
-            st.session_state["input_source"] = input_source
-
             st.divider()
 
-            if input_source == "CSV":
-                batch_mode = st.checkbox(
-                    "Batch Processing Mode",
-                    value=False,
-                    help="Process multiple CSV files at once"
-                )
-            else:
-                batch_mode = False
-                st.session_state["batch_mode"] = False
-                st.info("Bruker input is converted to CSV and processed as a single dataset.")
+            batch_mode = st.checkbox(
+                "Batch Processing Mode",
+                value=False,
+                help="Process multiple CSV files at once"
+            )
             st.session_state["batch_mode"] = batch_mode
 
             sub_col1, sub_col2 = st.columns([0.30, 0.70])
 
             with sub_col1:
                 st.markdown("**Step 1: Select the Metadata as .xlsx**")
-                self.meta_fp = st.file_uploader("Step 1: Upload Metadata (.xlsx)", type=["xlsx"], key="meta_file")
+                self.meta_fp = st.file_uploader(
+                    "Step 1: Upload Metadata (.xlsx)",
+                    type=["xlsx"],
+                    key="meta_file"
+                )
 
-# Select the Spectrum as csv 
-                if input_source == "CSV":
-                    if not batch_mode:
-                        st.markdown('**Step 2: Select Spectrum as .csv**')
-                        self.data_fp = st.file_uploader("Step 2: Upload Spectrum (.csv)", type=["csv"], key="spectrum_file")
-                        self.data_files = [self.data_fp] if self.data_fp else []
-
-                    else:
-                    # BATCH MODE - Multiple Files
-                        st.markdown('**Step 2: Select Multiple Spectra as .csv**')
-                        uploaded_files = st.file_uploader(
-                            "Upload multiple Spectrum files (.csv)",
-                            type=["csv"],
-                            accept_multiple_files=True,
-                            key="spectrum_files_batch"
-                        )
-                        self.data_files = uploaded_files if uploaded_files else []
-                        self.data_fp = None  
-                        
-                        if self.data_files:
-                            st.info(f"📁 {len(self.data_files)} files selected")
+                if not batch_mode:
+                    st.markdown("**Step 2: Select Spectrum as .csv**")
+                    self.data_fp = st.file_uploader(
+                        "Step 2: Upload Spectrum (.csv)",
+                        type=["csv"],
+                        key="spectrum_file"
+                    )
+                    self.data_files = [self.data_fp] if self.data_fp else []
                 else:
-                    st.markdown('**Step 2: Select a Bruker folder**')
-                    if st.button("Choose Bruker folder", key="choose_bruker_folder"):
-                        selected_folder = self._pick_folder("Select the Bruker pdata/1 folder")
-                        if selected_folder is not None:
-                            try:
-                                bruker_buffer, bruker_pdata_path = self._prepare_bruker_input(selected_folder)
-                                st.session_state["bruker_selected_folder"] = str(selected_folder)
-                                st.session_state["bruker_pdata_path"] = str(bruker_pdata_path)
-                                st.session_state["bruker_csv_bytes"] = bruker_buffer.getvalue()
-                                st.session_state["bruker_csv_name"] = bruker_buffer.name
-                            except Exception as exc:
-                                st.session_state.pop("bruker_csv_bytes", None)
-                                st.session_state.pop("bruker_csv_name", None)
-                                st.session_state.pop("bruker_selected_folder", None)
-                                st.session_state.pop("bruker_pdata_path", None)
-                                st.error(f"Bruker conversion failed: {exc}")
+                    st.markdown("**Step 2: Select Multiple Spectra as .csv**")
+                    uploaded_files = st.file_uploader(
+                        "Upload multiple Spectrum files (.csv)",
+                        type=["csv"],
+                        accept_multiple_files=True,
+                        key="spectrum_files_batch"
+                    )
+                    self.data_files = uploaded_files if uploaded_files else []
+                    self.data_fp = None
 
-                    if st.session_state.get("bruker_csv_bytes"):
-                        self.data_fp = io.BytesIO(st.session_state["bruker_csv_bytes"])
-                        self.data_fp.name = st.session_state.get("bruker_csv_name", "bruker.csv")
-                        self.data_files = [self.data_fp]
-                        st.success(f"Bruker folder selected: {st.session_state.get('bruker_selected_folder', '')}")
-                        st.info(f"Converted file: {self.data_fp.name}")
-                    else:
-                        self.data_fp = None
-                        self.data_files = []
-                        st.warning("No Bruker folder selected yet.")
+                    if self.data_files:
+                        st.info(f"📁 {len(self.data_files)} files selected")
 
                 apply_reference = st.checkbox(
                     "Apply signal referencing (optional)",
@@ -260,7 +105,11 @@ class StreamlitApp:
 
                 if st.session_state.get("use_reference", True):
                     st.markdown("**Step 3: Select the Reference File as .csv**")
-                    self.reference_fp = st.file_uploader("Step 3: Upload Reference (.csv)", type=["csv"], key="reference_file")
+                    self.reference_fp = st.file_uploader(
+                        "Step 3: Upload Reference (.csv)",
+                        type=["csv"],
+                        key="reference_file"
+                    )
                 else:
                     self.reference_fp = None
                     st.info("Reference file disabled. Results will be in arbitrary units (a.u.).")
@@ -398,19 +247,27 @@ class StreamlitApp:
                 output_dir = os.path.abspath("output")
 
                 if os.path.exists(output_dir):
-                    zip_path = os.path.join(tempfile.gettempdir(), "results.zip")
-                    shutil.make_archive(zip_path.replace(".zip", ""), "zip", output_dir)
+                    try:
+                        zip_path = os.path.join(os.path.abspath("."), "results.zip")
+                        if os.path.exists(zip_path):
+                            os.remove(zip_path)
 
-                    with open(zip_path, "rb") as f:
-                        zip_bytes = f.read()
+                        shutil.make_archive(zip_path.replace(".zip", ""), "zip", output_dir)
 
-                    st.download_button(
-                        label="📥 Download All Results (ZIP)",
-                        data=zip_bytes,
-                        file_name="results.zip",
-                        mime="application/zip",
-                        key="download_zip"
-                    )
+                        with open(zip_path, "rb") as f:
+                            zip_bytes = f.read()
+
+                        st.download_button(
+                            label="📥 Download All Results (ZIP)",
+                            data=zip_bytes,
+                            file_name="results.zip",
+                            mime="application/zip",
+                            key="download_zip"
+                        )
+                    except OSError as e:
+                        st.error(f"ZIP creation failed: {e}")
+                    except Exception as e:
+                        st.error(f"Unexpected error during ZIP creation: {e}")
                 else:
                     st.warning("Output folder not found.")
             else:
@@ -670,9 +527,9 @@ class StreamlitApp:
                 - Visualize the full measured spectrum and select the depth [%]
                 - Select export format before saving
 
-                #### Stacked Spectra Plot
-                - Visualize multiple spectra stacked vertically
-                - Adjust frame range and spacing
+                #### Waterfall Plot
+                - Visualize spectra in 3D waterfall form
+                - Adjust horizontal and vertical viewing angles
                 - Select export format before saving
 
                 #### Reference Plot
@@ -705,19 +562,8 @@ class StreamlitApp:
             if ext == "pdf":
                 session_obj.save_fig(fig=fig, name=save_path.with_suffix(""))
             elif ext in ["png", "jpg", "jpeg"]:
-                if hasattr(fig, "write_image"):
-                    plotly_format = "jpeg" if ext == "jpg" else ext
-                    fig.write_image(
-                        str(save_path),
-                        format=plotly_format,
-                        engine="kaleido",
-                        width=1000,
-                        height=700,
-                        scale=1
-                    )
-                else:
-                    matplotlib_format = "jpeg" if ext == "jpg" else ext
-                    fig.savefig(str(save_path), format=matplotlib_format, dpi=300, bbox_inches="tight")
+                matplotlib_format = "jpeg" if ext == "jpg" else ext
+                fig.savefig(str(save_path), format=matplotlib_format, dpi=300, bbox_inches="tight")
             else:
                 st.error(f"Unsupported format: {selected_format}")
                 return
@@ -813,14 +659,7 @@ class StreamlitApp:
                 key=f"panel1_export_format_{file_name}_{time_frame}"
             )
 
-            self.save_plot_with_format(
-                session_obj=st.session_state["panel_1_obj"],
-                fig=one_plot,
-                file_basename=file_name,
-                file_name=f"Substrate_{file_name}_{time_frame}",
-                button_key=f"panel1_{file_name}_{time_frame}",
-                selected_format=export_format
-            )
+            st.info("For heavy interactive Plotly plots, export is fastest from the camera icon in the toolbar.")
 
     def panel2(self):
         if "panel_2_obj" not in st.session_state or st.session_state["panel_2_obj"] is None:
@@ -850,14 +689,7 @@ class StreamlitApp:
                 key=f"panel2_export_format_{file_name}"
             )
 
-            self.save_plot_with_format(
-                session_obj=st.session_state["panel_2_obj"],
-                fig=fig,
-                file_basename=file_name,
-                file_name=f"Kinetic_{file_name}",
-                button_key=f"panel2_{file_name}",
-                selected_format=export_format
-            )
+            st.info("For heavy interactive Plotly plots, export is fastest from the camera icon in the toolbar.")
 
     def panel3(self):
         if "panel_3_obj" not in st.session_state or st.session_state["panel_3_obj"] is None:
@@ -950,10 +782,10 @@ class StreamlitApp:
             st.error("No processed data found. Please process data first.")
             return
 
-        with st.expander("Panel 6 - Stacked Spectra (Waterfall Plot)", expanded=True):
-            st.markdown("# Stacked Spectra")
+        with st.expander("Panel 6 - Waterfall Plot", expanded=True):
+            st.markdown("# Waterfall Plot")
 
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
 
             with col1:
                 show_fit = st.checkbox("Show fitted spectra", value=False)
@@ -962,43 +794,35 @@ class StreamlitApp:
                 show_every_nth = st.slider("Show every n-th timepoint", 1, 10, 1)
 
             with col3:
-                spacing_factor = st.slider("Vertical spacing", 0.5, 3.0, 1.5, step=0.1)
+                azim = st.slider("Horizontal angle (°)", min_value=0, max_value=360, value=30, step=5)
 
-            max_intensity = st.session_state["panel_6_obj"].data.iloc[:, 1:].max().max()
-            spacing = max_intensity * spacing_factor
-
-            fig = st.session_state["panel_6_obj"].plot_plotly(
-                spacing=spacing,
-                show_fit=show_fit,
-                show_every_nth=show_every_nth
-            )
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                config={"displayModeBar": True}
-            )
+            with col4:
+                elev = st.slider("Vertical angle (°)", min_value=5, max_value=90, value=25, step=5)
 
             file_name = os.path.splitext(os.path.basename(data_path))[0]
 
-            fig_mpl = st.session_state["panel_6_obj"].plot_matplotlib(
-                spacing=spacing,
+            fig_mpl = st.session_state["panel_6_obj"].plot_matplotlib_3d(
+                azim=azim,
+                elev=elev,
                 show_fit=show_fit,
                 show_every_nth=show_every_nth
             )
+
+            st.pyplot(fig_mpl, clear_figure=False)
 
             export_format = st.selectbox(
                 "Choose export format",
                 options=["PDF", "PNG", "JPG"],
                 index=0,
-                key=f"panel6_export_format_{file_name}_{show_fit}_{show_every_nth}_{spacing_factor}"
+                key=f"panel6_export_format_{file_name}_{show_fit}_{show_every_nth}_{azim}_{elev}"
             )
 
             self.save_plot_with_format(
                 session_obj=st.session_state["panel_6_obj"],
                 fig=fig_mpl,
                 file_basename=file_name,
-                file_name=f"Stacked_Spectra_{file_name}",
-                button_key=f"panel6_{file_name}_{show_fit}_{show_every_nth}_{spacing_factor}",
+                file_name=f"Waterfall_{file_name}_azim{azim}_elev{elev}",
+                button_key=f"panel6_{file_name}_{show_fit}_{show_every_nth}_{azim}_{elev}",
                 selected_format=export_format
             )
 
