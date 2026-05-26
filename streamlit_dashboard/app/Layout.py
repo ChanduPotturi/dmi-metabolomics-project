@@ -7,7 +7,6 @@ import pandas as pd
 import plotly.io as pio
 import streamlit as st
 
-import io
 import nmrglue as ng
 import numpy as np
 from scipy.signal import find_peaks
@@ -123,6 +122,46 @@ def create_zip_bytes_cached(folder_path, folder_signature):
                 full_path = os.path.join(root, file)
                 arcname = os.path.relpath(full_path, folder_path)
                 zip_file.write(full_path, arcname)
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+
+def selected_output_dirs_signature(output_dirs):
+    """Signature only for the output folders belonging to the current run."""
+    sig = []
+    for folder_path in output_dirs:
+        if not os.path.exists(folder_path):
+            continue
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                p = os.path.join(root, file)
+                try:
+                    sig.append((p, os.path.getmtime(p), os.path.getsize(p)))
+                except OSError:
+                    pass
+    return tuple(sig)
+
+
+@st.cache_data(show_spinner=False)
+def create_zip_selected_dirs_cached(output_root, output_dirs, folder_signature):
+    """
+    Create ZIP only from the result folders of the current experiment/run.
+    This prevents old batch results from being included in later downloads.
+    """
+    zip_buffer = io.BytesIO()
+    output_root = os.path.abspath(output_root)
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for folder_path in output_dirs:
+            if not os.path.exists(folder_path):
+                continue
+
+            for root, _, files in os.walk(folder_path):
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    arcname = os.path.relpath(full_path, output_root)
+                    zip_file.write(full_path, arcname)
 
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
@@ -619,6 +658,29 @@ class StreamlitApp:
 
         self.about_page(about)
 
+    def get_current_output_dirs(self, output_root):
+        """
+        Return only the output folders related to the current processed file/batch.
+        This avoids mixing old experiment outputs into the ZIP download.
+        """
+        output_dirs = []
+
+        if st.session_state.get("batch_mode", False) and st.session_state.get("batch_results"):
+            successful_files = st.session_state.get("batch_results", {}).get("successful", [])
+            for filename in successful_files:
+                base_name = os.path.splitext(os.path.basename(filename))[0]
+                folder_path = os.path.join(output_root, f"{base_name}_output")
+                if os.path.exists(folder_path):
+                    output_dirs.append(folder_path)
+
+        elif st.session_state.get("file_name"):
+            base_name = st.session_state.get("file_name")
+            folder_path = os.path.join(output_root, f"{base_name}_output")
+            if os.path.exists(folder_path):
+                output_dirs.append(folder_path)
+
+        return output_dirs
+
     def main_page(self, main):
         with main:
             st.markdown("#### Main Page Content")
@@ -689,36 +751,29 @@ class StreamlitApp:
                 output_dir = os.path.abspath("output")
 
                 if os.path.exists(output_dir):
-<<<<<<< HEAD
-                    zip_path = os.path.join(tempfile.gettempdir(), "results.zip")
-                    shutil.make_archive(zip_path.replace(".zip", ""), "zip", output_dir)
+                    current_output_dirs = self.get_current_output_dirs(output_dir)
 
-                    with open(zip_path, "rb") as f:
-                        zip_bytes = f.read()
+                    if current_output_dirs:
+                        try:
+                            sig = selected_output_dirs_signature(tuple(current_output_dirs))
+                            zip_bytes = create_zip_selected_dirs_cached(
+                                output_dir,
+                                tuple(current_output_dirs),
+                                sig
+                            )
 
-                    st.download_button(
-                        label="📥 Download All Results (ZIP)",
-                        data=zip_bytes,
-                        file_name="results.zip",
-                        mime="application/zip",
-                        key="download_zip"
-                    )
-=======
-                    try:
-                        sig = output_folder_signature(output_dir)
-                        zip_bytes = create_zip_bytes_cached(output_dir, sig)
+                            st.download_button(
+                                label="📥 Download Current Results (ZIP)",
+                                data=zip_bytes,
+                                file_name="current_results.zip",
+                                mime="application/zip",
+                                key="download_zip_current"
+                            )
 
-                        st.download_button(
-                            label="📥 Download All Results (ZIP)",
-                            data=zip_bytes,
-                            file_name="results.zip",
-                            mime="application/zip",
-                            key="download_zip"
-                        )
-
-                    except Exception as e:
-                        st.error(f"ZIP creation failed: {e}")
->>>>>>> 4da00a2 (Update waterfall plot features and UI improvements)
+                        except Exception as e:
+                            st.error(f"ZIP creation failed: {e}")
+                    else:
+                        st.warning("No current output folders found for this run.")
                 else:
                     st.warning("Output folder not found.")
 
@@ -863,121 +918,6 @@ class StreamlitApp:
             else:
                 st.warning("No reference file provided. Panel 4 will be skipped.")
 
-<<<<<<< HEAD
-        st.session_state["panel_6_obj"] = StackedSpectraPlot(file_path=tmp_data_path)
-
-    def about_page(self, about):
-        with about:
-            st.markdown(
-                """
-                ### Instructions:
-
-                #### Step 0:
-                **Choose the Model:**
-
-                **Model 1:**
-                Lorenzian curve fitting with parameters of the Meta Description
-
-                **Model 2:**
-                Lorenzian curve fitting + initial parameters derived from actual spectrum
-
-                #### Step 1:
-                - **Select the Metadata**
-                - **Select the Substrate**
-                - **Select the Reference File**
-
-                #### Step 2:
-                - Click Start Processing
-
-                #### Step 3:
-                ##### Substrate Plot
-                - Use sliders to select the frame
-                - Use the legend to show or hide lines
-                - Select export format before saving
-
-                #### Kinetic Plot
-                - Kinetics of metabolites and substrate peaks
-                - Select export format before saving
-
-                #### Contour Plot
-                - Visualize the full measured spectrum and select the depth [%]
-                - Select export format before saving
-
-                #### Stacked Spectra Plot
-                - Visualize multiple spectra stacked vertically
-                - Adjust frame range and spacing
-                - Select export format before saving
-
-                #### Reference Plot
-                - Get the reference value on water
-                - Select export format before saving
-                """
-            )
-        return None
-
-    def safe_frame_slider(self, label, n_frames, default=1):
-        if n_frames <= 1:
-            st.info("Only one frame available.")
-            return 1
-
-        return st.slider(
-            label,
-            min_value=1,
-            max_value=n_frames,
-            value=min(default, n_frames)
-        )
-
-    def save_plot_with_format(self, session_obj, fig, file_basename, file_name, button_key, selected_format):
-        plot_dir = Path("output", file_basename + "_output", "plots")
-        os.makedirs(plot_dir, exist_ok=True)
-
-        ext = selected_format.lower()
-        save_path = Path(plot_dir, f"{file_name}_{file_basename}.{ext}")
-
-        if st.button(f"Save as {selected_format}", key=f"save_{button_key}_{ext}"):
-            if ext == "pdf":
-                session_obj.save_fig(fig=fig, name=save_path.with_suffix(""))
-            elif ext in ["png", "jpg", "jpeg"]:
-                if hasattr(fig, "write_image"):
-                    plotly_format = "jpeg" if ext == "jpg" else ext
-                    fig.write_image(
-                        str(save_path),
-                        format=plotly_format,
-                        engine="kaleido",
-                        width=1000,
-                        height=700,
-                        scale=1
-                    )
-                else:
-                    matplotlib_format = "jpeg" if ext == "jpg" else ext
-                    fig.savefig(str(save_path), format=matplotlib_format, dpi=300, bbox_inches="tight")
-            else:
-                st.error(f"Unsupported format: {selected_format}")
-                return
-
-            st.session_state[f"saved_file_{button_key}"] = str(save_path)
-            st.success(f"Saved: {save_path}")
-
-        saved_file = st.session_state.get(f"saved_file_{button_key}")
-        if saved_file and os.path.exists(saved_file):
-            mime_map = {
-                "pdf": "application/pdf",
-                "png": "image/png",
-                "jpg": "image/jpeg",
-                "jpeg": "image/jpeg"
-            }
-            ext_saved = Path(saved_file).suffix.lower().replace(".", "")
-            with open(saved_file, "rb") as f:
-                st.download_button(
-                    label=f"Download {Path(saved_file).name}",
-                    data=f.read(),
-                    file_name=os.path.basename(saved_file),
-                    mime=mime_map.get(ext_saved, "application/octet-stream"),
-                    key=f"download_{button_key}_{ext_saved}"
-                )
-
-=======
->>>>>>> 4da00a2 (Update waterfall plot features and UI improvements)
     def panel1(self):
         tmp_data_path = st.session_state.get("tmp_data_path")
 
@@ -1040,18 +980,7 @@ class StreamlitApp:
                 button_key=f"panel1_{file_name}_{selected_frame}"
             )
 
-<<<<<<< HEAD
-            self.save_plot_with_format(
-                session_obj=st.session_state["panel_1_obj"],
-                fig=one_plot,
-                file_basename=file_name,
-                file_name=f"Substrate_{file_name}_{time_frame}",
-                button_key=f"panel1_{file_name}_{time_frame}",
-                selected_format=export_format
-            )
 
-=======
->>>>>>> 4da00a2 (Update waterfall plot features and UI improvements)
     def panel2(self):
         tmp_data_path = st.session_state.get("tmp_data_path")
 
@@ -1078,18 +1007,6 @@ class StreamlitApp:
                 button_key=f"panel2_{file_name}"
             )
 
-<<<<<<< HEAD
-            self.save_plot_with_format(
-                session_obj=st.session_state["panel_2_obj"],
-                fig=fig,
-                file_basename=file_name,
-                file_name=f"Kinetic_{file_name}",
-                button_key=f"panel2_{file_name}",
-                selected_format=export_format
-            )
-
-=======
->>>>>>> 4da00a2 (Update waterfall plot features and UI improvements)
     def panel3(self):
         tmp_data_path = st.session_state.get("tmp_data_path")
 
@@ -1172,12 +1089,6 @@ class StreamlitApp:
             st.error("Panel 6 object not initialized. Please process data first.")
             return
 
-<<<<<<< HEAD
-        with st.expander("Panel 6 - Stacked Spectra (Waterfall Plot)", expanded=True):
-            st.markdown("# Stacked Spectra")
-
-            col1, col2, col3 = st.columns(3)
-=======
         file_name = os.path.splitext(os.path.basename(data_path))[0]
         panel6_obj = st.session_state["panel_6_obj"]
         max_timepoints = panel6_obj.n_timepoints
@@ -1186,7 +1097,6 @@ class StreamlitApp:
             st.markdown("# Waterfall Plot")
 
             with st.form(f"panel6_form_{file_name}"):
->>>>>>> 4da00a2 (Update waterfall plot features and UI improvements)
 
                 plot_mode = st.selectbox(
                     "Select waterfall display mode",
@@ -1214,18 +1124,6 @@ class StreamlitApp:
                     )
                 )
 
-<<<<<<< HEAD
-            with col3:
-                spacing_factor = st.slider("Vertical spacing", 0.5, 3.0, 1.5, step=0.1)
-
-            max_intensity = st.session_state["panel_6_obj"].data.iloc[:, 1:].max().max()
-            spacing = max_intensity * spacing_factor
-
-            fig = st.session_state["panel_6_obj"].plot_plotly(
-                spacing=spacing,
-                show_fit=show_fit,
-                show_every_nth=show_every_nth
-=======
                 col1, col2, col3, col4 = st.columns(4)
 
                 with col1:
@@ -1297,47 +1195,21 @@ class StreamlitApp:
                 show_every_nth=selected_every,
                 smooth=selected_smooth,
                 smooth_window=selected_smooth_window
->>>>>>> 4da00a2 (Update waterfall plot features and UI improvements)
-            )
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                config={"displayModeBar": True}
             )
 
-            file_name = os.path.splitext(os.path.basename(data_path))[0]
+            st.pyplot(fig_mpl, clear_figure=False)
 
-            fig_mpl = st.session_state["panel_6_obj"].plot_matplotlib(
-                spacing=spacing,
-                show_fit=show_fit,
-                show_every_nth=show_every_nth
-            )
-
-<<<<<<< HEAD
-            export_format = st.selectbox(
-                "Choose export format",
-                options=["PDF", "PNG", "JPG"],
-                index=0,
-                key=f"panel6_export_format_{file_name}_{show_fit}_{show_every_nth}_{spacing_factor}"
-            )
-=======
             approx_peaks = panel6_obj.validate_peak_positions()
             if approx_peaks:
                 st.caption(
                     f"Approximate major peak positions across time (ppm): "
                     f"min={approx_peaks[0]:.2f}, median={approx_peaks[1]:.2f}, max={approx_peaks[2]:.2f}"
                 )
->>>>>>> 4da00a2 (Update waterfall plot features and UI improvements)
 
             self.save_matplotlib_formats(
                 session_obj=panel6_obj,
                 fig=fig_mpl,
                 file_basename=file_name,
-<<<<<<< HEAD
-                file_name=f"Stacked_Spectra_{file_name}",
-                button_key=f"panel6_{file_name}_{show_fit}_{show_every_nth}_{spacing_factor}",
-                selected_format=export_format
-=======
                 file_name=(
                     f"Waterfall_{file_name}_"
                     f"{selected_mode.replace(' ', '_').replace('+', 'plus')}_"
@@ -1375,7 +1247,6 @@ class StreamlitApp:
                 - Adjust viewing angles
                 - Apply smoothing
                 """
->>>>>>> 4da00a2 (Update waterfall plot features and UI improvements)
             )
 
     def run(self):
