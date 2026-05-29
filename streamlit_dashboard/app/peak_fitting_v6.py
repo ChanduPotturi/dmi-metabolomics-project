@@ -8,6 +8,8 @@ from tqdm import tqdm
 import streamlit as st
 import tempfile
 
+from peak_chunking import apply_metadata_chunking, label_from_metadata_column, log_chunking_stats
+
 
 class PeakFitting:
     """
@@ -71,7 +73,13 @@ class PeakFitting:
             as CSV files in the output directory.
     """
 
-    def __init__(self, fp_file, fp_meta):
+    def __init__(
+        self,
+        fp_file,
+        fp_meta,
+        enable_chunking: bool = True,
+        chunk_half_width: float = 0.5,
+    ):
         # file paths
         self.fp_file = fp_file
         self.fp_meta = fp_meta
@@ -114,6 +122,10 @@ class PeakFitting:
         self.positions, self.names = self.extract_ppm_all()
         self.number_peaks = len(self.positions)
         self.number_substances = len(set(self.names))
+
+        self.enable_chunking = enable_chunking
+        self.chunk_half_width = chunk_half_width
+        self._setup_chunking()
 
          # initialize outputs
         column_names =  ['Time_Step'] + ['y_shift'] + [f'{name}_pos_{pos}' for name, pos in zip(self.names, self.positions)] + [f'{name}_width_{pos}' for name, pos in zip(self.names, self.positions)] + [f'{name}_amp_{pos}' for name, pos in zip(self.names, self.positions)]
@@ -175,12 +187,16 @@ class PeakFitting:
         positions = []
         names = []
 
+        substrate_name = label_from_metadata_column(
+            self.meta_df, "Substrate", "Substrate"
+        )
+
         # Substrat-PPM
         try:
             react_substrat = str(self.meta_df['Substrate_ppm'].iloc[0]).split(',')
             if react_substrat != ['nan']:
                 for val in react_substrat:
-                    names.append('ReacSubs')
+                    names.append(substrate_name)
                     positions.append(float(val))
         except Exception as e:
             print("No substrate found:", e)
@@ -190,8 +206,11 @@ class PeakFitting:
             try:
                 react_metabolite = str(self.meta_df[f'Metabolite_{i}_ppm'].iloc[0]).split(',')
                 if react_metabolite != ['nan']:
+                    metabolite_name = label_from_metadata_column(
+                        self.meta_df, f"Metabolite_{i}", f"Metabolite {i}"
+                    )
                     for val in react_metabolite:
-                        names.append(f'Metab{i}')
+                        names.append(metabolite_name)
                         positions.append(float(val))
             except Exception:
                 continue
@@ -199,13 +218,40 @@ class PeakFitting:
         # Add water (always available)
         try:
             positions.append(float(self.meta_df['Water_ppm'].iloc[0]))
-            names.append('Water')
+            names.append(label_from_metadata_column(self.meta_df, "Water", "Water"))
         except Exception:
             positions.append(4.7)
-            names.append('Water')
+            names.append("Water")
 
-        return positions, names 
+        return positions, names
 
+    def _setup_chunking(self):
+        """Metadata ppm → chunk windows → merge; restrict fitting to chunk mask."""
+        if not self.enable_chunking:
+            self.fit_mask = np.ones(len(self.x), dtype=bool)
+            self.chunk_stats = {}
+            self.merged_chunks = []
+            self.chunk_result = None
+            return
+
+        chunk_result = apply_metadata_chunking(
+            self.df,
+            metadata_peaks=self.positions,
+            metadata_peak_names=self.names,
+            half_width=self.chunk_half_width,
+        )
+        self.chunk_result = chunk_result
+        self.fit_mask = chunk_result.mask
+        self.merged_chunks = chunk_result.merged_chunks
+        self.chunk_stats = chunk_result.stats
+        log_chunking_stats(chunk_result)
+
+    def _fitting_xy(self, y):
+        """Return (x, y) arrays restricted to merged peak chunks when chunking is enabled."""
+        if self.enable_chunking and hasattr(self, "fit_mask"):
+            mask = self.fit_mask
+            return self.x[mask].to_numpy(), y[mask].to_numpy()
+        return self.x.to_numpy(), y.to_numpy()
 
     def make_bounds(self, mode, positions_fine = None,
                     y_shift = (0, np.inf),
@@ -316,10 +362,11 @@ class PeakFitting:
         for i in tqdm(range(self.number_time_points), desc= self.file_name):
             try: # try in case some data can not be fitted
                 y = self.df.iloc[:,i+1]
+                x_fit, y_fit = self._fitting_xy(y)
                 # to increase fitting speed, increase tolerance 
                 if first_fit:
                     popt, pcov = curve_fit(lambda x, *params: self.grey_spectrum(x,*params),
-                                        self.x, y, p0=[0] + [0] + [0.1]*self.number_substances + [1000]*self.number_substances,
+                                        x_fit, y_fit, p0=[0] + [0] + [0.1]*self.number_substances + [1000]*self.number_substances,
                                         maxfev=3000, ftol=1e-1, xtol=1e-1, bounds=flattened_bounds)
                     
                     y_shift = np.array([popt[0]])
@@ -336,7 +383,7 @@ class PeakFitting:
 
                 # Fine tune the fit
                 popt, pcov = curve_fit(lambda x, *params: self.grey_spectrum_fine_tune(x, *params),
-                                        self.x, y, p0 = p0, maxfev=20000, bounds = flattened_bounds_fine, ftol=1e-6, xtol=1e-6)
+                                        x_fit, y_fit, p0 = p0, maxfev=20000, bounds = flattened_bounds_fine, ftol=1e-6, xtol=1e-6)
 
                 y_shift = np.array([popt[0]])
                 positions_fine = popt[1:self.number_peaks+1]

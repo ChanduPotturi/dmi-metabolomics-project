@@ -11,6 +11,9 @@ import tempfile
 import zipfile
 import io
 
+from peak_chunking import apply_metadata_chunking, label_from_metadata_column, log_chunking_stats
+
+
 class PeakFitting:
     '''
     This class performs Lorentzian peak fitting on multi-frame NMR spectra using a 
@@ -95,7 +98,13 @@ class PeakFitting:
     • All NaN and inf-containing rows are removed to avoid curve_fit failures.  
     • Prefitting significantly improves accuracy and convergence speed.  
     '''
-    def __init__(self, fp_file, fp_meta):
+    def __init__(
+        self,
+        fp_file,
+        fp_meta,
+        enable_chunking: bool = True,
+        chunk_half_width: float = 0.5,
+    ):
         # st.write('Using v7')
         # file paths
         self.fp_file = fp_file
@@ -136,6 +145,10 @@ class PeakFitting:
         self.number_peaks = len(self.positions)
         self.number_substances = len(set(self.names))
 
+        self.enable_chunking = enable_chunking
+        self.chunk_half_width = chunk_half_width
+        self._setup_chunking()
+
         # initialize output DataFrames
         column_names =  ['Time_Step'] + ['y_shift'] + [f'{name}_pos_{pos}' for name, pos in zip(self.names, self.positions)] + [f'{name}_width_{pos}' for name, pos in zip(self.names, self.positions)] + [f'{name}_amp_{pos}' for name, pos in zip(self.names, self.positions)]
 
@@ -156,6 +169,34 @@ class PeakFitting:
         # use spectral peak detection to refine initial peak positions
         fix_pos = SpectraAnalysis(self.df, self.positions)
         self.positions = fix_pos.peak_df()['Found Peaks']
+
+    def _setup_chunking(self):
+        """Metadata ppm → chunk windows → merge; restrict fitting to chunk mask."""
+        if not self.enable_chunking:
+            self.fit_mask = np.ones(len(self.x), dtype=bool)
+            self.chunk_stats = {}
+            self.merged_chunks = []
+            self.chunk_result = None
+            return
+
+        chunk_result = apply_metadata_chunking(
+            self.df,
+            metadata_peaks=self.positions,
+            metadata_peak_names=self.names,
+            half_width=self.chunk_half_width,
+        )
+        self.chunk_result = chunk_result
+        self.fit_mask = chunk_result.mask
+        self.merged_chunks = chunk_result.merged_chunks
+        self.chunk_stats = chunk_result.stats
+        log_chunking_stats(chunk_result)
+
+    def _fitting_xy(self, y):
+        """Return (x, y) arrays restricted to merged peak chunks when chunking is enabled."""
+        if self.enable_chunking and hasattr(self, "fit_mask"):
+            mask = self.fit_mask
+            return self.x[mask].to_numpy(), y[mask].to_numpy()
+        return self.x.to_numpy(), y.to_numpy()
 
     def extract_ppm_all(self):
         """
@@ -192,23 +233,30 @@ class PeakFitting:
         positions = []
         names = []
 
+        substrate_name = label_from_metadata_column(
+            self.meta_df, "Substrate", "Substrate"
+        )
+
         react_substrat = str(self.meta_df['Substrate_ppm'].iloc[0]).split(',')
-        if react_substrat:
-            for i in range(len(react_substrat)):
-                names.append('ReacSubs')
-                positions.append(float(react_substrat[i]))
+        if react_substrat and react_substrat != ['nan']:
+            for val in react_substrat:
+                names.append(substrate_name)
+                positions.append(float(val))
 
         for i in range(1, 6):
             react_metabolite = str(self.meta_df[f'Metabolite_{i}_ppm'].iloc[0]).split(',')
             if react_metabolite == ['nan']:
                 continue
-            for j in range(len(react_metabolite)):
-                names.append(f'Metab{i}')
-                positions.append(float(react_metabolite[j]))
+            metabolite_name = label_from_metadata_column(
+                self.meta_df, f"Metabolite_{i}", f"Metabolite {i}"
+            )
+            for val in react_metabolite:
+                names.append(metabolite_name)
+                positions.append(float(val))
 
         # water ppm
         positions.append(float(self.meta_df['Water_ppm'].iloc[0]))
-        names.append('Water')
+        names.append(label_from_metadata_column(self.meta_df, "Water", "Water"))
 
         return positions, names
 
@@ -294,6 +342,7 @@ class PeakFitting:
         for i in tqdm(range(self.number_time_points), desc= self.file_name):
             try: # try in case some data can not be fitted
                 y = self.df.iloc[:,i+1]
+                x_fit, y_fit = self._fitting_xy(y)
                 # to increase fitting speed, increase tolerance 
                 self.current_time_point = i
                 # first fit kann weg
@@ -304,7 +353,7 @@ class PeakFitting:
 
                 # Fine tune the fit
                 popt, pcov = curve_fit(lambda x, *params: self.grey_spectrum_fine_tune(x, *params),
-                                        self.x, y, p0 = p0, maxfev=20000, bounds = flattened_bounds_fine, ftol=1e-6, xtol=1e-6)
+                                        x_fit, y_fit, p0 = p0, maxfev=20000, bounds = flattened_bounds_fine, ftol=1e-6, xtol=1e-6)
                 
                 y_shift = np.array([popt[0]])
                 positions_fine = popt[1:self.number_peaks+1]
