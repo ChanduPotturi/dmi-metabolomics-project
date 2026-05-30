@@ -1,9 +1,11 @@
 import os
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 import pandas as pd
+import plotly.io as pio
 import streamlit as st
 
 import io
@@ -92,6 +94,169 @@ def process_to_dataframe(pdata_path: Path) -> pd.DataFrame:
     return df.loc[mask_range].reset_index(drop=True)
 
 
+def file_signature(path):
+    if path and os.path.exists(path):
+        return os.path.getmtime(path)
+    return None
+
+
+def selected_output_dirs_signature(output_dirs):
+    sig = []
+    for folder_path in output_dirs:
+        if not os.path.exists(folder_path):
+            continue
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                p = os.path.join(root, file)
+                try:
+                    sig.append((p, os.path.getmtime(p), os.path.getsize(p)))
+                except OSError:
+                    pass
+    return tuple(sig)
+
+
+@st.cache_data(show_spinner=False)
+def create_zip_selected_dirs_cached(output_root, output_dirs, folder_signature):
+    """ZIP only the output folders from the current run (not older experiments)."""
+    zip_buffer = io.BytesIO()
+    output_root = os.path.abspath(output_root)
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for folder_path in output_dirs:
+            if not os.path.exists(folder_path):
+                continue
+            for root, _, files in os.walk(folder_path):
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    arcname = os.path.relpath(full_path, output_root)
+                    zip_file.write(full_path, arcname)
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+
+@st.cache_data(show_spinner=True)
+def run_processing_cached(
+    data_path,
+    meta_path,
+    ref_path,
+    model_name,
+    enable_chunking,
+    chunk_half_width,
+    data_sig,
+    meta_sig,
+    ref_sig,
+):
+    from peak_chunking import ChunkingResult, save_chunk_artifacts
+
+    if model_name == "Model 1":
+        from peak_fitting_v6 import PeakFitting
+    else:
+        from peak_fitting_v7 import PeakFitting
+
+    t_start = time.perf_counter()
+    fitter = PeakFitting(
+        data_path,
+        meta_path,
+        enable_chunking=enable_chunking,
+        chunk_half_width=chunk_half_width,
+    )
+    t_setup = time.perf_counter()
+    fitter.fit()
+    t_fit = time.perf_counter()
+
+    file_basename = os.path.splitext(os.path.basename(data_path))[0]
+    os.makedirs(fitter.output_direc, exist_ok=True)
+    fitter.fitting_params.to_csv(os.path.join(fitter.output_direc, "fitting_params.csv"))
+    fitter.fitting_params_error.to_csv(os.path.join(fitter.output_direc, "fitting_params_error.csv"))
+
+    processor = Process4Panels(data_path)
+    processor.save_sum_spectra()
+    processor.save_substrate_individual()
+    processor.save_individual_peaks()
+    processor.save_difference()
+    processor.save_kinetics()
+    t_post = time.perf_counter()
+
+    timings = {
+        "setup_s": t_setup - t_start,
+        "fitting_s": t_fit - t_setup,
+        "postprocess_s": t_post - t_fit,
+        "total_s": t_post - t_start,
+    }
+
+    out_dir = Path("output", file_basename + "_output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    chunk_result = getattr(fitter, "chunk_result", None)
+    if chunk_result is None:
+        n_rows = len(fitter.x) if hasattr(fitter, "x") else 0
+        chunk_result = ChunkingResult(
+            metadata_peaks=[],
+            raw_intervals=[],
+            merged_chunks=[],
+            mask=np.ones(n_rows, dtype=bool) if n_rows else np.array([], dtype=bool),
+            stats={
+                "n_metadata_peaks": 0,
+                "n_peak_centers_for_chunking": 0,
+                "n_raw_chunks": 0,
+                "n_merged_chunks": 0,
+                "n_merged_from_overlap": 0,
+                "fraction_of_rows_in_chunks": 1.0 if n_rows else 0.0,
+            },
+        )
+    save_chunk_artifacts(
+        out_dir,
+        chunk_result,
+        half_width=chunk_half_width,
+        enable_chunking=enable_chunking,
+        timings=timings,
+    )
+
+    if ref_path and os.path.exists(ref_path):
+        try:
+            ref_processor = Reference(fp_ref=ref_path, fp_meta=meta_path, fp_data=data_path)
+            ref_processor.save_kinetics_mmol()
+        except Exception:
+            pass
+
+    return {
+        "data_path": data_path,
+        "meta_path": meta_path,
+        "ref_path": ref_path,
+        "file_name": file_basename,
+        "timings": timings,
+        "chunk_stats": getattr(fitter, "chunk_stats", {}) or {},
+        "enable_chunking": enable_chunking,
+    }
+
+
+@st.cache_resource(show_spinner=False)
+def get_panel1_cached(data_path, sig):
+    return Panel1SpectrumPlot(file_path=data_path)
+
+
+@st.cache_resource(show_spinner=False)
+def get_panel2_cached(data_path, sig):
+    return KineticPlot(path=data_path)
+
+
+@st.cache_resource(show_spinner=False)
+def get_panel3_cached(data_path, sig):
+    return ContourPlot(file_path=data_path)
+
+
+@st.cache_resource(show_spinner=False)
+def get_panel6_cached(data_path, sig):
+    return StackedSpectraPlot(file_path=data_path)
+
+
+@st.cache_resource(show_spinner=False)
+def get_reference_cached(ref_path, meta_path, data_path, ref_sig, meta_sig, data_sig):
+    obj = Reference(fp_ref=ref_path, fp_meta=meta_path, fp_data=data_path)
+    obj.save_kinetics_mmol()
+    return obj
+
+
 class StreamlitApp:
     def __init__(self, fig1=None, fig2=None, fig3=None, fig4=None):
         self.fig1 = fig1
@@ -176,9 +341,13 @@ class StreamlitApp:
             if selected_option == "Model 1: Lorentzian Fit":
                 st.session_state["Model 1"] = True
                 st.session_state["Model 2"] = False
+                model_name = "Model 1"
             else:
                 st.session_state["Model 1"] = False
                 st.session_state["Model 2"] = True
+                model_name = "Model 2"
+
+            st.session_state["model_name"] = model_name
 
             enable_chunking = st.checkbox(
                 "Enable metadata-based chunking",
@@ -288,11 +457,6 @@ class StreamlitApp:
                     self.reference_fp = None
                     st.info("Reference file disabled. Results will be in arbitrary units (a.u.).")
 
-        if st.session_state["Model 1"] is True:
-            from peak_fitting_v6 import PeakFitting
-        else:
-            from peak_fitting_v7 import PeakFitting
-
         with sub_col2:
             st.markdown("**Uploaded Files**")
 
@@ -340,12 +504,12 @@ class StreamlitApp:
             st.session_state["button_pressed"] = False
 
             if batch_mode:
-                self.process_batch(PeakFitting)
+                self.process_batch()
                 if st.session_state.get("batch_results", {}).get("successful"):
                     self.process_plots()
             else:
-                with st.spinner("Processing the data. Please wait..."):
-                    self.process_data(PeakFitting)
+                with st.spinner("Processing data. First run may take time; repeated runs use cache..."):
+                    self.process_data()
                     self.process_plots()
 
         with col3:
@@ -369,76 +533,101 @@ class StreamlitApp:
             if st.session_state.get("batch_mode", False):
                 if st.session_state.get("batch_results"):
                     results = st.session_state["batch_results"]
-
                     st.success(
-                        f"Batch processing completed: {len(results['successful'])} of {results['total']} files processed successfully"
+                        f"Batch processing completed: {len(results['successful'])} of "
+                        f"{results['total']} files processed successfully"
                     )
-
-                    st.info(
-                        """
-                        ### Batch Processing Complete
-
-                        All results have been saved in the `output/` folder. Each file has its own subdirectory:
-                        - `output/{filename}_output/`
-
-                        To view individual results:
-                        1. Switch off Batch Processing Mode
-                        2. Upload a single file
-                        3. View the analysis panels
-                        """
-                    )
-
-                    if results["successful"]:
-                        st.markdown("---")
-                        st.markdown("### View Individual Results")
-                        selected_file = st.selectbox(
-                            "Select a processed file to view:",
-                            options=results["successful"]
-                        )
-
-                        if st.button("Load Selected File"):
-                            st.info(f"Loading {selected_file}... (This feature can be implemented)")
                 else:
                     st.info("Click 'Start Processing' to process multiple files.")
 
             if st.session_state.get("processing_started", False):
-                if (
-                    st.session_state.get("file_name") is not None
-                    or (st.session_state.get("batch_mode") and st.session_state.get("batch_results"))
-                ):
-                    self.panel1()
-                    self.panel2()
-                    self.panel3()
-                    self.panel7()
-                    self.panel6()
+                st.info(
+                    "For faster interaction, each panel renders only when enabled. "
+                    "Plot controls update only after clicking Apply where available."
+                )
 
-                if st.session_state.get("panel_4_obj") is not None:
+                show_panel1 = st.checkbox("Show Panel 1 - Substrate Plot", value=True, key="show_panel1")
+                show_panel2 = st.checkbox("Show Panel 2 - Kinetic Plot", value=True, key="show_panel2")
+                show_panel3 = st.checkbox("Show Panel 3 - Contour Plot", value=False, key="show_panel3")
+                show_panel4 = st.checkbox("Show Panel 4 - Reference Plot", value=False, key="show_panel4")
+                show_panel6 = st.checkbox("Show Panel 6 - Waterfall Plot", value=False, key="show_panel6")
+                show_panel7 = st.checkbox(
+                    "Show Panel 7 - Peak Fitting Chunks",
+                    value=True,
+                    key="show_panel7",
+                )
+
+                if show_panel1:
+                    self.panel1()
+                if show_panel2:
+                    self.panel2()
+                if show_panel3:
+                    self.panel3()
+                if show_panel7:
+                    self.panel7()
+                if show_panel4:
                     self.panel4()
+                if show_panel6:
+                    self.panel6()
 
                 st.markdown("---")
                 st.markdown("### Download Results")
 
-                import shutil
                 output_dir = os.path.abspath("output")
-
                 if os.path.exists(output_dir):
-                    zip_path = os.path.join(tempfile.gettempdir(), "results.zip")
-                    shutil.make_archive(zip_path.replace(".zip", ""), "zip", output_dir)
-
-                    with open(zip_path, "rb") as f:
-                        zip_bytes = f.read()
-
-                    st.download_button(
-                        label="📥 Download All Results (ZIP)",
-                        data=zip_bytes,
-                        file_name="results.zip",
-                        mime="application/zip",
-                        key="download_zip"
-                    )
+                    current_output_dirs = self.get_current_output_dirs(output_dir)
+                    if current_output_dirs:
+                        try:
+                            sig = selected_output_dirs_signature(tuple(current_output_dirs))
+                            zip_bytes = create_zip_selected_dirs_cached(
+                                output_dir,
+                                tuple(current_output_dirs),
+                                sig,
+                            )
+                            st.download_button(
+                                label="📥 Download Current Results (ZIP)",
+                                data=zip_bytes,
+                                file_name="current_results.zip",
+                                mime="application/zip",
+                                key="download_zip_current",
+                            )
+                        except Exception as e:
+                            st.error(f"ZIP creation failed: {e}")
+                    else:
+                        st.warning("No current output folders found for this run.")
                 else:
                     st.warning("Output folder not found.")
             else:
                 st.info("Click 'Start Processing' to see the analysis panels.")
+
+    def _get_upload_dir(self):
+        upload_dir = Path("runtime_uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        return upload_dir
+
+    def _save_uploaded_file(self, uploaded_file):
+        upload_dir = self._get_upload_dir()
+        target_path = upload_dir / uploaded_file.name
+        with open(target_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        return str(target_path.resolve())
+
+    def get_current_output_dirs(self, output_root):
+        """Output folders for the current single-file or batch run only."""
+        output_dirs = []
+
+        if st.session_state.get("batch_mode", False) and st.session_state.get("batch_results"):
+            for filename in st.session_state["batch_results"].get("successful", []):
+                base_name = os.path.splitext(os.path.basename(filename))[0]
+                folder_path = os.path.join(output_root, f"{base_name}_output")
+                if os.path.exists(folder_path):
+                    output_dirs.append(folder_path)
+        elif st.session_state.get("file_name"):
+            folder_path = os.path.join(output_root, f"{st.session_state['file_name']}_output")
+            if os.path.exists(folder_path):
+                output_dirs.append(folder_path)
+
+        return output_dirs
 
     def _peak_fitting_kwargs(self) -> dict:
         """Build PeakFitting constructor kwargs from session state."""
@@ -503,10 +692,18 @@ class StreamlitApp:
             f"post-process: {self._format_duration(timings.get('postprocess_s', 0))})"
         )
 
-    def _show_chunking_summary(self, fitter, file_label: str | None = None):
-        """Display peak-chunking diagnostics after fitting."""
-        stats = getattr(fitter, "chunk_stats", None)
-        if not stats or not getattr(fitter, "enable_chunking", False):
+    def _show_chunking_summary(
+        self,
+        fitter=None,
+        file_label: str | None = None,
+        stats: dict | None = None,
+        enable_chunking: bool | None = None,
+    ):
+        """Display metadata-chunking diagnostics after fitting."""
+        if stats is None and fitter is not None:
+            stats = getattr(fitter, "chunk_stats", None)
+            enable_chunking = getattr(fitter, "enable_chunking", False)
+        if not stats or not enable_chunking:
             return
 
         prefix = f"**{file_label}** — " if file_label else ""
@@ -520,94 +717,58 @@ class StreamlitApp:
             f"{stats.get('fraction_of_rows_in_chunks', 0):.0%} of spectrum rows used for fitting."
         )
 
-    def process_data(self, PeakFitting):
+    def process_data(self):
         if not self.data_fp or not self.meta_fp:
             st.error("Please upload both the spectrum (.csv) and metadata (.xlsx) files before processing.")
             return
 
-        original_data_name = self.data_fp.name
-        original_meta_name = self.meta_fp.name
+        data_path = self._save_uploaded_file(self.data_fp)
+        meta_path = self._save_uploaded_file(self.meta_fp)
+        ref_path = (
+            self._save_uploaded_file(self.reference_fp)
+            if self.reference_fp and st.session_state.get("use_reference", True)
+            else None
+        )
 
-        tmp_data_dir = tempfile.gettempdir()
-        tmp_data_path = os.path.join(tmp_data_dir, original_data_name)
-        tmp_meta_path = os.path.join(tmp_data_dir, original_meta_name)
+        result = run_processing_cached(
+            data_path=data_path,
+            meta_path=meta_path,
+            ref_path=ref_path,
+            model_name=st.session_state.get("model_name", "Model 1"),
+            enable_chunking=st.session_state.get("enable_chunking", True),
+            chunk_half_width=float(st.session_state.get("chunk_half_width", 0.5)),
+            data_sig=file_signature(data_path),
+            meta_sig=file_signature(meta_path),
+            ref_sig=file_signature(ref_path) if ref_path else None,
+        )
 
-        with open(tmp_data_path, "wb") as f:
-            f.write(self.data_fp.getbuffer())
+        st.session_state["tmp_data_path"] = result["data_path"]
+        st.session_state["tmp_meta_path"] = result["meta_path"]
+        st.session_state["tmp_ref_path"] = result["ref_path"]
+        st.session_state["file_name"] = result["file_name"]
+        st.session_state["processing_timings"] = result["timings"]
+        self._show_processing_time(result["timings"])
+        self._show_chunking_summary(
+            file_label=None,
+            stats=result.get("chunk_stats"),
+            enable_chunking=result.get("enable_chunking"),
+        )
 
-        with open(tmp_meta_path, "wb") as f:
-            f.write(self.meta_fp.getbuffer())
-
-        if self.reference_fp:
-            original_ref_name = self.reference_fp.name
-            tmp_ref_path = os.path.join(tmp_data_dir, original_ref_name)
-            with open(tmp_ref_path, "wb") as f:
-                f.write(self.reference_fp.getbuffer())
-        else:
-            tmp_ref_path = None
-
-        t_start = time.perf_counter()
-        fitter = PeakFitting(tmp_data_path, tmp_meta_path, **self._peak_fitting_kwargs())
-        t_setup = time.perf_counter()
-        fitter.fit()
-        t_fit = time.perf_counter()
-
-        file_basename = os.path.splitext(original_data_name)[0]
-
-        fitting_params_path = os.path.join(fitter.output_direc, "fitting_params.csv")
-        fitting_params_error_path = os.path.join(fitter.output_direc, "fitting_params_error.csv")
-
-        fitter.fitting_params.to_csv(fitting_params_path)
-        fitter.fitting_params_error.to_csv(fitting_params_error_path)
-
-        processor = Process4Panels(tmp_data_path)
-        processor.save_sum_spectra()
-        processor.save_substrate_individual()
-        processor.save_individual_peaks()
-        processor.save_difference()
-        processor.save_kinetics()
-        t_post = time.perf_counter()
-
-        timings = {
-            "setup_s": t_setup - t_start,
-            "fitting_s": t_fit - t_setup,
-            "postprocess_s": t_post - t_fit,
-            "total_s": t_post - t_start,
-        }
-        st.session_state["processing_timings"] = timings
-        self._save_chunk_artifacts(fitter, file_basename, timings=timings)
-        self._show_processing_time(timings)
-        self._show_chunking_summary(fitter)
-
-        st.session_state["tmp_data_path"] = tmp_data_path
-        st.session_state["tmp_meta_path"] = tmp_meta_path
-        st.session_state["tmp_ref_path"] = tmp_ref_path
-        st.session_state["file_name"] = os.path.splitext(original_data_name)[0]
-
-    def process_batch(self, PeakFitting):
+    def process_batch(self):
         if not self.meta_fp or not self.data_files:
             st.error("Please upload metadata and at least one spectrum file.")
             return
 
-        tmp_data_dir = tempfile.gettempdir()
-        original_meta_name = self.meta_fp.name
-        tmp_meta_path = os.path.join(tmp_data_dir, original_meta_name)
-
-        with open(tmp_meta_path, "wb") as f:
-            f.write(self.meta_fp.getbuffer())
-
-        if self.reference_fp:
-            original_ref_name = self.reference_fp.name
-            tmp_ref_path = os.path.join(tmp_data_dir, original_ref_name)
-            with open(tmp_ref_path, "wb") as f:
-                f.write(self.reference_fp.getbuffer())
-        else:
-            tmp_ref_path = None
+        meta_path = self._save_uploaded_file(self.meta_fp)
+        ref_path = (
+            self._save_uploaded_file(self.reference_fp)
+            if self.reference_fp and st.session_state.get("use_reference", True)
+            else None
+        )
 
         total_files = len(self.data_files)
         progress_bar = st.progress(0)
         status_text = st.empty()
-        results_container = st.container()
 
         successful_files = []
         failed_files = []
@@ -615,64 +776,30 @@ class StreamlitApp:
         batch_t0 = time.perf_counter()
 
         for idx, data_file in enumerate(self.data_files):
-            file_progress = (idx + 1) / total_files
             status_text.text(f"Processing file {idx + 1}/{total_files}: {data_file.name}")
-            progress_bar.progress(file_progress)
+            progress_bar.progress((idx + 1) / total_files)
 
             try:
-                original_data_name = data_file.name
-                tmp_data_path = os.path.join(tmp_data_dir, original_data_name)
-
-                with open(tmp_data_path, "wb") as f:
-                    f.write(data_file.getbuffer())
-
-                file_basename = os.path.splitext(original_data_name)[0]
-                t_file_start = time.perf_counter()
-
-                with st.spinner(f"Fitting peaks for {data_file.name}..."):
-                    fitter = PeakFitting(tmp_data_path, tmp_meta_path, **self._peak_fitting_kwargs())
-                    t_setup = time.perf_counter()
-                    fitter.fit()
-                    t_fit = time.perf_counter()
-
-                    fitting_params_path = os.path.join(fitter.output_direc, "fitting_params.csv")
-                    fitting_params_error_path = os.path.join(fitter.output_direc, "fitting_params_error.csv")
-                    fitter.fitting_params.to_csv(fitting_params_path)
-                    fitter.fitting_params_error.to_csv(fitting_params_error_path)
-
-                with st.spinner(f"Processing data for {data_file.name}..."):
-                    processor = Process4Panels(tmp_data_path)
-                    processor.save_sum_spectra()
-                    processor.save_substrate_individual()
-                    processor.save_individual_peaks()
-                    processor.save_difference()
-                    processor.save_kinetics()
-                    t_post = time.perf_counter()
-
-                timings = {
-                    "setup_s": t_setup - t_file_start,
-                    "fitting_s": t_fit - t_setup,
-                    "postprocess_s": t_post - t_fit,
-                    "total_s": t_post - t_file_start,
-                }
-                self._save_chunk_artifacts(fitter, file_basename, timings=timings)
-                batch_timings.append((data_file.name, timings))
-                self._show_processing_time(timings, file_label=data_file.name)
-                self._show_chunking_summary(fitter, file_label=data_file.name)
-
-                if tmp_ref_path and st.session_state.get("use_reference", True):
-                    try:
-                        ref_processor = Reference(
-                            fp_ref=tmp_ref_path,
-                            fp_meta=tmp_meta_path,
-                            fp_data=tmp_data_path
-                        )
-                        ref_processor.save_kinetics_mmol()
-                    except Exception as e:
-                        st.warning(f"Reference processing failed for {data_file.name}: {str(e)}")
-
+                data_path = self._save_uploaded_file(data_file)
+                result = run_processing_cached(
+                    data_path=data_path,
+                    meta_path=meta_path,
+                    ref_path=ref_path,
+                    model_name=st.session_state.get("model_name", "Model 1"),
+                    enable_chunking=st.session_state.get("enable_chunking", True),
+                    chunk_half_width=float(st.session_state.get("chunk_half_width", 0.5)),
+                    data_sig=file_signature(data_path),
+                    meta_sig=file_signature(meta_path),
+                    ref_sig=file_signature(ref_path) if ref_path else None,
+                )
+                batch_timings.append((data_file.name, result["timings"]))
+                self._show_processing_time(result["timings"], file_label=data_file.name)
+                self._show_chunking_summary(
+                    file_label=data_file.name,
+                    stats=result.get("chunk_stats"),
+                    enable_chunking=result.get("enable_chunking"),
+                )
                 successful_files.append(data_file.name)
-
             except Exception as e:
                 failed_files.append((data_file.name, str(e)))
                 st.error(f"Failed to process {data_file.name}: {str(e)}")
@@ -689,91 +816,71 @@ class StreamlitApp:
             "n_files": len(batch_timings),
         }
 
-        with results_container:
-            st.success("Batch processing completed!")
-            if batch_timings:
-                self._show_processing_time(
-                    st.session_state["processing_timings"],
-                    file_label=f"{len(batch_timings)} files",
-                )
+        st.success("Batch processing completed!")
+        if batch_timings:
+            self._show_processing_time(
+                st.session_state["processing_timings"],
+                file_label=f"{len(batch_timings)} files",
+            )
 
-            col_success, col_failed = st.columns(2)
-
-            with col_success:
-                st.metric("Successful", len(successful_files))
-                if successful_files:
-                    with st.expander("View successful files"):
-                        for file in successful_files:
-                            st.text(file)
-
-            with col_failed:
-                st.metric("Failed", len(failed_files))
-                if failed_files:
-                    with st.expander("View failed files"):
-                        for file, error in failed_files:
-                            st.text(f"Error: {file}")
-                            st.caption(f"Error: {error}")
-
+        col_success, col_failed = st.columns(2)
+        with col_success:
+            st.metric("Successful", len(successful_files))
             if successful_files:
-                summary_text = "Batch Processing Summary\n"
-                summary_text += "=" * 50 + "\n\n"
-                summary_text += f"Total files: {total_files}\n"
-                summary_text += f"Successful: {len(successful_files)}\n"
-                summary_text += f"Failed: {len(failed_files)}\n\n"
-
-                summary_text += "Successful Files:\n"
-                for file in successful_files:
-                    summary_text += f"{file}\n"
-
-                if failed_files:
-                    summary_text += "\nFailed Files:\n"
+                with st.expander("View successful files"):
+                    for file in successful_files:
+                        st.text(file)
+        with col_failed:
+            st.metric("Failed", len(failed_files))
+            if failed_files:
+                with st.expander("View failed files"):
                     for file, error in failed_files:
-                        summary_text += f"Error: {file}: {error}\n"
-
-                st.download_button(
-                    label="Download Summary",
-                    data=summary_text,
-                    file_name="batch_processing_summary.txt",
-                    mime="text/plain"
-                )
+                        st.text(file)
+                        st.caption(f"Error: {error}")
 
         st.session_state["batch_results"] = {
             "successful": successful_files,
             "failed": failed_files,
-            "total": total_files
+            "total": total_files,
         }
 
         if successful_files:
             last_file = successful_files[-1]
-            st.session_state["tmp_data_path"] = os.path.join(tmp_data_dir, last_file)
+            last_path = str((self._get_upload_dir() / last_file).resolve())
+            st.session_state["tmp_data_path"] = last_path
             st.session_state["file_name"] = os.path.splitext(last_file)[0]
-            st.session_state["tmp_meta_path"] = tmp_meta_path
-            st.session_state["tmp_ref_path"] = tmp_ref_path
+            st.session_state["tmp_meta_path"] = meta_path
+            st.session_state["tmp_ref_path"] = ref_path
 
         st.session_state["processing_done"] = True
 
     def process_plots(self):
-        tmp_data_path = st.session_state.get("tmp_data_path")
-        tmp_meta_path = st.session_state.get("tmp_meta_path")
-        tmp_ref_path = st.session_state.get("tmp_ref_path")
+        data_path = st.session_state.get("tmp_data_path")
+        meta_path = st.session_state.get("tmp_meta_path")
+        ref_path = st.session_state.get("tmp_ref_path")
         use_reference = st.session_state.get("use_reference", True)
 
-        if not tmp_data_path or not os.path.exists(tmp_data_path):
-            st.error("Temporary data file not found. Please process data first.")
+        if not data_path or not os.path.exists(data_path):
+            st.error(f"Processed spectrum file not found: {data_path}")
             return
 
-        st.session_state["panel_1_obj"] = Panel1SpectrumPlot(file_path=tmp_data_path)
-        st.session_state["panel_2_obj"] = KineticPlot(path=tmp_data_path)
-        st.session_state["panel_3_obj"] = ContourPlot(file_path=tmp_data_path)
+        data_sig = file_signature(data_path)
 
-        if use_reference and tmp_ref_path and os.path.exists(tmp_ref_path):
+        st.session_state["panel_1_obj"] = get_panel1_cached(data_path, data_sig)
+        st.session_state["panel_2_obj"] = get_panel2_cached(data_path, data_sig)
+        st.session_state["panel_3_obj"] = get_panel3_cached(data_path, data_sig)
+        st.session_state["panel_6_obj"] = get_panel6_cached(data_path, data_sig)
+
+        if use_reference and ref_path and os.path.exists(ref_path):
             try:
-                st.session_state["panel_4_obj"] = Reference(
-                    fp_ref=tmp_ref_path,
-                    fp_meta=tmp_meta_path,
-                    fp_data=tmp_data_path
+                st.session_state["panel_4_obj"] = get_reference_cached(
+                    ref_path,
+                    meta_path,
+                    data_path,
+                    file_signature(ref_path),
+                    file_signature(meta_path),
+                    data_sig,
                 )
-                st.session_state["panel_4_obj"].save_kinetics_mmol()
                 st.success("Reference processing completed. Results available in mmol.")
             except Exception as e:
                 st.error(f"Error processing reference: {str(e)}")
@@ -785,10 +892,8 @@ class StreamlitApp:
             else:
                 st.warning("No reference file provided. Panel 4 will be skipped.")
 
-        st.session_state["panel_6_obj"] = StackedSpectraPlot(file_path=tmp_data_path)
-
         try:
-            st.session_state["panel_7_obj"] = ChunkRegionsPlot(file_path=tmp_data_path)
+            st.session_state["panel_7_obj"] = ChunkRegionsPlot(file_path=data_path)
         except Exception as e:
             st.warning(f"Could not load chunk panel: {e}")
             st.session_state["panel_7_obj"] = None
