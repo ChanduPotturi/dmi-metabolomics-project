@@ -112,7 +112,7 @@ class PeakFitting:
         self.meta_df = pd.read_excel(fp_meta)
 
         print("Loaded metadata columns:", self.meta_df.columns.tolist())
-        print("Loaded metadata entries:", self.meta_df['File'].astype(str).tolist())
+        print("Loaded metadata entries:", self.meta_df['File_Name_for_CSV'].astype(str).tolist())
 
         self.number_time_points = self.df.shape[1] - 1
         self.time_points = np.arange(1, self.number_time_points + 1) 
