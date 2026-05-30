@@ -644,9 +644,11 @@ class StreamlitApp:
                     help="Process multiple CSV files at once"
                 )
             else:
-                batch_mode = False
-                st.session_state["batch_mode"] = False
-                st.info("Bruker input is converted to CSV and processed as a single dataset.")
+                batch_mode = st.checkbox(
+                    "Batch Processing Mode (Bruker)",
+                    value=False,
+                    help="Process multiple Bruker run folders at once (select folders one-by-one)"
+                )
             st.session_state["batch_mode"] = batch_mode
 
             sub_col1, sub_col2 = st.columns([0.30, 0.70])
@@ -676,32 +678,107 @@ class StreamlitApp:
                             st.info(f"📁 {len(self.data_files)} files selected")
                 else:
                     st.markdown('**Step 2: Select a Bruker folder**')
-                    if st.button("Choose Bruker folder", key="choose_bruker_folder"):
-                        selected_folder = self._pick_folder("Select the Bruker pdata/1 folder")
-                        if selected_folder is not None:
-                            try:
-                                bruker_buffer, bruker_pdata_path = self._prepare_bruker_input(selected_folder)
-                                st.session_state["bruker_selected_folder"] = str(selected_folder)
-                                st.session_state["bruker_pdata_path"] = str(bruker_pdata_path)
-                                st.session_state["bruker_csv_bytes"] = bruker_buffer.getvalue()
-                                st.session_state["bruker_csv_name"] = bruker_buffer.name
-                            except Exception as exc:
-                                st.session_state.pop("bruker_csv_bytes", None)
-                                st.session_state.pop("bruker_csv_name", None)
-                                st.session_state.pop("bruker_selected_folder", None)
-                                st.session_state.pop("bruker_pdata_path", None)
-                                st.error(f"Bruker conversion failed: {exc}")
 
-                    if st.session_state.get("bruker_csv_bytes"):
-                        self.data_fp = io.BytesIO(st.session_state["bruker_csv_bytes"])
-                        self.data_fp.name = st.session_state.get("bruker_csv_name", "bruker.csv")
-                        self.data_files = [self.data_fp]
-                        st.success(f"Bruker folder selected: {st.session_state.get('bruker_selected_folder', '')}")
-                        st.info(f"Converted file: {self.data_fp.name}")
+                    # Batch-enabled: allow adding multiple Bruker folders
+                    if batch_mode:
+                        if st.button("Add Bruker folder", key="add_bruker_folder"):
+                            selected_folder = self._pick_folder("Select a Bruker run folder")
+                            if selected_folder is not None:
+                                try:
+                                    bruker_buffer, bruker_pdata_path = self._prepare_bruker_input(selected_folder)
+                                    entry = {
+                                        "folder": str(selected_folder),
+                                        "pdata": str(bruker_pdata_path),
+                                        "bytes": bruker_buffer.getvalue(),
+                                        "name": bruker_buffer.name,
+                                    }
+                                    lst = st.session_state.get("bruker_csv_list", [])
+                                    lst.append(entry)
+                                    st.session_state["bruker_csv_list"] = lst
+                                    st.session_state["bruker_show_success"] = True
+                                except Exception as exc:
+                                    st.error(f"Bruker conversion failed: {exc}")
+
+                        success_ph = st.empty()
+                        expander_ph = st.empty()
+                        clear_ph = st.empty()
+
+                        if st.session_state.get("bruker_csv_list"):
+                            if st.session_state.get("bruker_show_success", True):
+                                success_ph.success(f"{len(st.session_state['bruker_csv_list'])} Bruker folders added")
+
+                            with expander_ph.expander("View selected Bruker folders"):
+                                for i, e in enumerate(st.session_state.get("bruker_csv_list", []), 1):
+                                    st.write(f"{i}. {e['folder']} -> {e['name']}")
+                                    try:
+                                        st.download_button(
+                                            label=f"Download converted CSV {i}",
+                                            data=e.get("bytes", b""),
+                                            file_name=e.get("name", f"bruker_{i}.csv"),
+                                            mime="text/csv",
+                                            key=f"download_bruker_{i}"
+                                        )
+                                    except Exception:
+                                        st.text("(Download not available)")
+
+                            if clear_ph.button("Clear selected Bruker folders", key="clear_bruker_list"):
+                                st.session_state["bruker_csv_list"] = []
+                                st.session_state["bruker_show_success"] = False
+                                self.data_files = []
+                                self.data_fp = None
+                                try:
+                                    success_ph.empty()
+                                except Exception:
+                                    pass
+                                try:
+                                    expander_ph.empty()
+                                except Exception:
+                                    pass
+                                try:
+                                    clear_ph.empty()
+                                except Exception:
+                                    pass
+
+                            buffers = []
+                            for e in st.session_state.get("bruker_csv_list", []):
+                                b = io.BytesIO(e.get("bytes", b"")) if isinstance(e.get("bytes"), (bytes, bytearray)) else None
+                                if b is not None:
+                                    b.name = e.get("name", "bruker.csv")
+                                    buffers.append(b)
+                            self.data_files = buffers
+                            self.data_fp = None
+                        else:
+                            self.data_files = []
+                            self.data_fp = None
+                            st.info("No Bruker folders added yet. Click 'Add Bruker folder' to add one.")
+
                     else:
-                        self.data_fp = None
-                        self.data_files = []
-                        st.warning("No Bruker folder selected yet.")
+                        if st.button("Choose Bruker folder", key="choose_bruker_folder"):
+                            selected_folder = self._pick_folder("Select the Bruker pdata/1 folder")
+                            if selected_folder is not None:
+                                try:
+                                    bruker_buffer, bruker_pdata_path = self._prepare_bruker_input(selected_folder)
+                                    st.session_state["bruker_selected_folder"] = str(selected_folder)
+                                    st.session_state["bruker_pdata_path"] = str(bruker_pdata_path)
+                                    st.session_state["bruker_csv_bytes"] = bruker_buffer.getvalue()
+                                    st.session_state["bruker_csv_name"] = bruker_buffer.name
+                                except Exception as exc:
+                                    st.session_state.pop("bruker_csv_bytes", None)
+                                    st.session_state.pop("bruker_csv_name", None)
+                                    st.session_state.pop("bruker_selected_folder", None)
+                                    st.session_state.pop("bruker_pdata_path", None)
+                                    st.error(f"Bruker conversion failed: {exc}")
+
+                        if st.session_state.get("bruker_csv_bytes"):
+                            self.data_fp = io.BytesIO(st.session_state["bruker_csv_bytes"])
+                            self.data_fp.name = st.session_state.get("bruker_csv_name", "bruker.csv")
+                            self.data_files = [self.data_fp]
+                            st.success(f"Bruker folder selected: {st.session_state.get('bruker_selected_folder', '')}")
+                            st.info(f"Converted file: {self.data_fp.name}")
+                        else:
+                            self.data_fp = None
+                            self.data_files = []
+                            st.warning("No Bruker folder selected yet.")
 
                 apply_reference = st.checkbox(
                     "Apply signal referencing (optional)",
