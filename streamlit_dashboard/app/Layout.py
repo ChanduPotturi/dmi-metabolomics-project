@@ -882,15 +882,47 @@ class StreamlitApp:
 
     def main_page(self, main):
         with main:
+            st.components.v1.html("<script>window.scrollTo(0, 0);</script>", height=0)
             st.markdown("#### Main Page Content")
+            active_batch_file = st.session_state.get("active_batch_file")
 
-            if st.session_state.get("batch_mode", False):
+            if st.session_state.get("batch_mode", False) and not active_batch_file:
                 if st.session_state.get("batch_results"):
                     results = st.session_state["batch_results"]
                     st.success(
-                        f"Batch processing completed: {len(results['successful'])} of "
-                        f"{results['total']} files processed successfully"
+                        f"Batch processing completed: {len(results['successful'])} of {results['total']} files processed successfully"
                     )
+
+                    if results["successful"]:
+                        st.markdown("---")
+                        st.markdown("### View Individual Results")
+                        selected_file = st.selectbox(
+                            "Select a processed file to view:",
+                            options=results["successful"],
+                            key="batch_view_selected_file"
+                        )
+
+                        if st.session_state.get("batch_view_loaded_file") != selected_file:
+                            selected_path_temp = os.path.join(tempfile.gettempdir(), selected_file)
+                            selected_path_runtime = str((self._get_upload_dir() / selected_file).resolve())
+
+                            if os.path.exists(selected_path_temp):
+                                selected_path = selected_path_temp
+                            elif os.path.exists(selected_path_runtime):
+                                selected_path = selected_path_runtime
+                            else:
+                                selected_path = None
+
+                            if selected_path:
+                                st.session_state["tmp_data_path"] = selected_path
+                                st.session_state["file_name"] = os.path.splitext(selected_file)[0]
+                                st.session_state["batch_view_loaded_file"] = selected_file
+                                self.process_plots()
+                                st.success(f"Loaded {selected_file}")
+                            else:
+                                st.error(
+                                    f"Could not find {selected_file} in the temporary folder or runtime uploads folder."
+                                )
                 else:
                     st.info("Click 'Start Processing' to process multiple files.")
 
