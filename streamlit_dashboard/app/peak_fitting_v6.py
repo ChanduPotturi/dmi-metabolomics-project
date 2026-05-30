@@ -112,7 +112,7 @@ class PeakFitting:
         self.meta_df = pd.read_excel(fp_meta)
 
         print("Loaded metadata columns:", self.meta_df.columns.tolist())
-        print("Loaded metadata entries:", self.meta_df["File"].astype(str).tolist())
+        print("Loaded metadata entries:", self.meta_df['File_Name_for_CSV'].astype(str).tolist())
 
         self.number_time_points = self.df.shape[1] - 1
         self.time_points = np.arange(1, self.number_time_points + 1) 
@@ -168,13 +168,29 @@ class PeakFitting:
             text = re.sub(r"\s+_", "_", text)
             return text
 
-        # Standardization of filter names
-        filename_base = _normalize_file_name(os.path.splitext(self.file_name)[0])
+        def _normalize_experiment_id(value):
+            text = str(value).strip().lower()
+            return re.sub(r"\.0+$", "", text)
 
-         # Handle both metadata formats
-        file_col = "File_Name_for_CSV" if "File_Name_for_CSV" in self.meta_df.columns else "File"
-        self.meta_df[file_col] = self.meta_df[file_col].astype(str).map(_normalize_file_name)
-        filtered = self.meta_df[self.meta_df[file_col].str.contains(filename_base, na=False)]
+        filename_base = _normalize_file_name(self.file_name)
+
+        if filename_base.endswith("_b"):
+            name = filename_base[:-2]
+            parts = name.rsplit("_", 1)
+            if len(parts) != 2:
+                return [4.7], ["Water"]
+
+            project_name = _normalize_file_name(parts[0])
+            experiment_id = _normalize_experiment_id(parts[1])
+            filtered = self.meta_df[
+                (self.meta_df["Project_Name"].astype(str).map(_normalize_file_name) == project_name) &
+                (self.meta_df["Experiment_ID"].astype(str).map(_normalize_experiment_id) == experiment_id)
+            ]
+        else:
+             # Handle both metadata formats
+            file_col = "File_Name_for_CSV" if "File_Name_for_CSV" in self.meta_df.columns else "File"
+            self.meta_df[file_col] = self.meta_df[file_col].astype(str).map(_normalize_file_name)
+            filtered = self.meta_df[self.meta_df[file_col].str.contains(filename_base, na=False)]
         
         # If no line was found:
         if filtered.empty:

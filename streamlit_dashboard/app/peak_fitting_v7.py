@@ -217,10 +217,28 @@ class PeakFitting:
             text = re.sub(r"\s+_", "_", text)
             return text
 
+        def _normalize_experiment_id(value):
+            text = str(value).strip().lower()
+            return re.sub(r"\.0+$", "", text)
+        
         normalized_file_name = _normalize_file_name(self.file_name)
-        self.meta_df = self.meta_df[
-            self.meta_df['File'].astype(str).map(_normalize_file_name) == normalized_file_name
-        ]
+
+        if normalized_file_name.endswith("_b"):
+            name = normalized_file_name[:-2]
+            parts = name.rsplit("_", 1)
+            if len(parts) != 2:
+                return [], []
+
+            project_name = _normalize_file_name(parts[0])
+            experiment_id = _normalize_experiment_id(parts[1])
+            self.meta_df = self.meta_df[
+                (self.meta_df["Project_Name"].astype(str).map(_normalize_file_name) == project_name) &
+                (self.meta_df["Experiment_ID"].astype(str).map(_normalize_experiment_id) == experiment_id)
+            ]
+        else:
+            self.meta_df = self.meta_df[
+                self.meta_df['File'].astype(str).map(_normalize_file_name) == normalized_file_name
+            ]
 
         if self.meta_df.empty:
             print(f"No metadata found for {self.file_name}")
