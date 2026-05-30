@@ -585,7 +585,7 @@ class StreamlitApp:
         run_name = pdata_path.parent.parent.name if pdata_path.parent.parent.name else Path(selected_folder).name
         sample_name = pdata_path.parent.parent.parent.name if pdata_path.parent.parent.parent.name else Path(selected_folder).name
         source_name = f"{sample_name}_{run_name}"
-        csv_buffer.name = f"{source_name}.csv"
+        csv_buffer.name = f"{source_name}_b.csv"
         return csv_buffer, pdata_path
 
     def header(self):
