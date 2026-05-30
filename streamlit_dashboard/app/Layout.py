@@ -1,5 +1,7 @@
 import io
 import os
+import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -23,6 +25,8 @@ from panel2_kinetic_plot import KineticPlot
 from panel3_contour_plot import ContourPlot
 from panel5_reference_plot import Reference
 from panel6_stacked_plot import StackedSpectraPlot
+from panel7_chunk_plot import ChunkRegionsPlot
+from peak_chunking import save_chunk_artifacts
 
 
 st.set_page_config(layout="wide", page_title="SBMI - Application", page_icon=":shark:")
@@ -168,20 +172,39 @@ def create_zip_selected_dirs_cached(output_root, output_dirs, folder_signature):
 
 
 @st.cache_data(show_spinner=True)
-def run_processing_cached(data_path, meta_path, ref_path, model_name, data_sig, meta_sig, ref_sig):
+def run_processing_cached(
+    data_path,
+    meta_path,
+    ref_path,
+    model_name,
+    enable_chunking,
+    chunk_half_width,
+    data_sig,
+    meta_sig,
+    ref_sig,
+):
+    from peak_chunking import ChunkingResult, save_chunk_artifacts
+
     if model_name == "Model 1":
         from peak_fitting_v6 import PeakFitting
     else:
         from peak_fitting_v7 import PeakFitting
 
-    fitter = PeakFitting(data_path, meta_path)
+    t_start = time.perf_counter()
+    fitter = PeakFitting(
+        data_path,
+        meta_path,
+        enable_chunking=enable_chunking,
+        chunk_half_width=chunk_half_width,
+    )
+    t_setup = time.perf_counter()
     fitter.fit()
+    t_fit = time.perf_counter()
 
-    fitting_params_path = os.path.join(fitter.output_direc, "fitting_params.csv")
-    fitting_params_error_path = os.path.join(fitter.output_direc, "fitting_params_error.csv")
-
-    fitter.fitting_params.to_csv(fitting_params_path)
-    fitter.fitting_params_error.to_csv(fitting_params_error_path)
+    file_basename = os.path.splitext(os.path.basename(data_path))[0]
+    os.makedirs(fitter.output_direc, exist_ok=True)
+    fitter.fitting_params.to_csv(os.path.join(fitter.output_direc, "fitting_params.csv"))
+    fitter.fitting_params_error.to_csv(os.path.join(fitter.output_direc, "fitting_params_error.csv"))
 
     processor = Process4Panels(data_path)
     processor.save_sum_spectra()
@@ -189,6 +212,41 @@ def run_processing_cached(data_path, meta_path, ref_path, model_name, data_sig, 
     processor.save_individual_peaks()
     processor.save_difference()
     processor.save_kinetics()
+    t_post = time.perf_counter()
+
+    timings = {
+        "setup_s": t_setup - t_start,
+        "fitting_s": t_fit - t_setup,
+        "postprocess_s": t_post - t_fit,
+        "total_s": t_post - t_start,
+    }
+
+    out_dir = Path("output", file_basename + "_output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    chunk_result = getattr(fitter, "chunk_result", None)
+    if chunk_result is None:
+        n_rows = len(fitter.x) if hasattr(fitter, "x") else 0
+        chunk_result = ChunkingResult(
+            metadata_peaks=[],
+            raw_intervals=[],
+            merged_chunks=[],
+            mask=np.ones(n_rows, dtype=bool) if n_rows else np.array([], dtype=bool),
+            stats={
+                "n_metadata_peaks": 0,
+                "n_peak_centers_for_chunking": 0,
+                "n_raw_chunks": 0,
+                "n_merged_chunks": 0,
+                "n_merged_from_overlap": 0,
+                "fraction_of_rows_in_chunks": 1.0 if n_rows else 0.0,
+            },
+        )
+    save_chunk_artifacts(
+        out_dir,
+        chunk_result,
+        half_width=chunk_half_width,
+        enable_chunking=enable_chunking,
+        timings=timings,
+    )
 
     if ref_path and os.path.exists(ref_path):
         try:
@@ -205,7 +263,10 @@ def run_processing_cached(data_path, meta_path, ref_path, model_name, data_sig, 
         "data_path": data_path,
         "meta_path": meta_path,
         "ref_path": ref_path,
-        "file_name": os.path.splitext(os.path.basename(data_path))[0],
+        "file_name": file_basename,
+        "timings": timings,
+        "chunk_stats": getattr(fitter, "chunk_stats", {}) or {},
+        "enable_chunking": enable_chunking,
     }
 
 
@@ -416,6 +477,55 @@ class StreamlitApp:
                             key=f"plotly_download_{button_key}_{idx}"
                         )
 
+    def save_plot_with_format(self, session_obj, fig, file_basename, file_name, button_key, selected_format):
+        plot_dir = Path("output", file_basename + "_output", "plots")
+        os.makedirs(plot_dir, exist_ok=True)
+
+        ext = selected_format.lower()
+        save_path = Path(plot_dir, f"{file_name}_{file_basename}.{ext}")
+
+        if st.button(f"Save as {selected_format}", key=f"save_{button_key}_{ext}"):
+            if ext == "pdf":
+                session_obj.save_fig(fig=fig, name=save_path.with_suffix(""))
+            elif ext in ["png", "jpg", "jpeg"]:
+                if hasattr(fig, "write_image"):
+                    plotly_format = "jpeg" if ext == "jpg" else ext
+                    fig.write_image(
+                        str(save_path),
+                        format=plotly_format,
+                        engine="kaleido",
+                        width=1000,
+                        height=700,
+                        scale=1
+                    )
+                else:
+                    matplotlib_format = "jpeg" if ext == "jpg" else ext
+                    fig.savefig(str(save_path), format=matplotlib_format, dpi=300, bbox_inches="tight")
+            else:
+                st.error(f"Unsupported format: {selected_format}")
+                return
+
+            st.session_state[f"saved_file_{button_key}"] = str(save_path)
+            st.success(f"Saved: {save_path}")
+
+        saved_file = st.session_state.get(f"saved_file_{button_key}")
+        if saved_file and os.path.exists(saved_file):
+            mime_map = {
+                "pdf": "application/pdf",
+                "png": "image/png",
+                "jpg": "image/jpeg",
+                "jpeg": "image/jpeg"
+            }
+            ext_saved = Path(saved_file).suffix.lower().replace(".", "")
+            with open(saved_file, "rb") as f:
+                st.download_button(
+                    label=f"Download {Path(saved_file).name}",
+                    data=f.read(),
+                    file_name=os.path.basename(saved_file),
+                    mime=mime_map.get(ext_saved, "application/octet-stream"),
+                    key=f"download_{button_key}_{ext_saved}"
+                )
+
     def _pick_folder(self, title):
         if sys.platform == "win32":
             try:
@@ -501,6 +611,26 @@ class StreamlitApp:
 
             st.session_state["model_name"] = model_name
 
+            enable_chunking = st.checkbox(
+                "Enable metadata-based chunking",
+                value=st.session_state.get("enable_chunking", True),
+                help="Fit only ppm regions around metadata peak positions (± half-width); overlapping windows are merged.",
+                key="enable_chunking_checkbox",
+            )
+            st.session_state["enable_chunking"] = enable_chunking
+
+            chunk_half_width = st.number_input(
+                "Chunk half-width (ppm)",
+                min_value=0.05,
+                max_value=5.0,
+                value=float(st.session_state.get("chunk_half_width", 0.5)),
+                step=0.05,
+                disabled=not enable_chunking,
+                help="Each metadata peak gets a window of ± this value in ppm before overlapping windows are merged.",
+                key="chunk_half_width_input",
+            )
+            st.session_state["chunk_half_width"] = float(chunk_half_width)
+
             input_options = ["CSV", "Bruker"]
             input_source = st.selectbox("Choose input type:", input_options)
             st.session_state["input_source"] = input_source
@@ -525,7 +655,6 @@ class StreamlitApp:
                 st.markdown("**Step 1: Select the Metadata as .xlsx**")
                 self.meta_fp = st.file_uploader("Step 1: Upload Metadata (.xlsx)", type=["xlsx"], key="meta_file")
 
-# Select the Spectrum as csv 
                 if input_source == "CSV":
                     if not batch_mode:
                         st.markdown('**Step 2: Select Spectrum as .csv**')
@@ -533,7 +662,6 @@ class StreamlitApp:
                         self.data_files = [self.data_fp] if self.data_fp else []
 
                     else:
-                    # BATCH MODE - Multiple Files
                         st.markdown('**Step 2: Select Multiple Spectra as .csv**')
                         uploaded_files = st.file_uploader(
                             "Upload multiple Spectrum files (.csv)",
@@ -659,23 +787,17 @@ class StreamlitApp:
         self.about_page(about)
 
     def get_current_output_dirs(self, output_root):
-        """
-        Return only the output folders related to the current processed file/batch.
-        This avoids mixing old experiment outputs into the ZIP download.
-        """
+        """Output folders for the current single-file or batch run only."""
         output_dirs = []
 
         if st.session_state.get("batch_mode", False) and st.session_state.get("batch_results"):
-            successful_files = st.session_state.get("batch_results", {}).get("successful", [])
-            for filename in successful_files:
+            for filename in st.session_state["batch_results"].get("successful", []):
                 base_name = os.path.splitext(os.path.basename(filename))[0]
                 folder_path = os.path.join(output_root, f"{base_name}_output")
                 if os.path.exists(folder_path):
                     output_dirs.append(folder_path)
-
         elif st.session_state.get("file_name"):
-            base_name = st.session_state.get("file_name")
-            folder_path = os.path.join(output_root, f"{base_name}_output")
+            folder_path = os.path.join(output_root, f"{st.session_state['file_name']}_output")
             if os.path.exists(folder_path):
                 output_dirs.append(folder_path)
 
@@ -689,7 +811,8 @@ class StreamlitApp:
                 if st.session_state.get("batch_results"):
                     results = st.session_state["batch_results"]
                     st.success(
-                        f"Batch processing completed: {len(results['successful'])} of {results['total']} files processed successfully"
+                        f"Batch processing completed: {len(results['successful'])} of "
+                        f"{results['total']} files processed successfully"
                     )
                 else:
                     st.info("Click 'Start Processing' to process multiple files.")
@@ -697,51 +820,30 @@ class StreamlitApp:
             if st.session_state.get("processing_started", False):
                 st.info(
                     "For faster interaction, each panel renders only when enabled. "
-                    "Plot controls update only after clicking Apply."
+                    "Plot controls update only after clicking Apply where available."
                 )
 
-                show_panel1 = st.checkbox(
-                    "Show Panel 1 - Substrate Plot",
+                show_panel1 = st.checkbox("Show Panel 1 - Substrate Plot", value=True, key="show_panel1")
+                show_panel2 = st.checkbox("Show Panel 2 - Kinetic Plot", value=True, key="show_panel2")
+                show_panel3 = st.checkbox("Show Panel 3 - Contour Plot", value=False, key="show_panel3")
+                show_panel4 = st.checkbox("Show Panel 4 - Reference Plot", value=False, key="show_panel4")
+                show_panel6 = st.checkbox("Show Panel 6 - Waterfall Plot", value=False, key="show_panel6")
+                show_panel7 = st.checkbox(
+                    "Show Panel 7 - Peak Fitting Chunks",
                     value=True,
-                    key="show_panel1"
-                )
-
-                show_panel2 = st.checkbox(
-                    "Show Panel 2 - Kinetic Plot",
-                    value=True,
-                    key="show_panel2"
-                )
-
-                show_panel3 = st.checkbox(
-                    "Show Panel 3 - Contour Plot",
-                    value=False,
-                    key="show_panel3"
-                )
-
-                show_panel4 = st.checkbox(
-                    "Show Panel 4 - Reference Plot",
-                    value=False,
-                    key="show_panel4"
-                )
-
-                show_panel6 = st.checkbox(
-                    "Show Panel 6 - Waterfall Plot",
-                    value=False,
-                    key="show_panel6"
+                    key="show_panel7",
                 )
 
                 if show_panel1:
                     self.panel1()
-
                 if show_panel2:
                     self.panel2()
-
                 if show_panel3:
                     self.panel3()
-
+                if show_panel7:
+                    self.panel7()
                 if show_panel4:
                     self.panel4()
-
                 if show_panel6:
                     self.panel6()
 
@@ -749,36 +851,119 @@ class StreamlitApp:
                 st.markdown("### Download Results")
 
                 output_dir = os.path.abspath("output")
-
                 if os.path.exists(output_dir):
                     current_output_dirs = self.get_current_output_dirs(output_dir)
-
                     if current_output_dirs:
                         try:
                             sig = selected_output_dirs_signature(tuple(current_output_dirs))
                             zip_bytes = create_zip_selected_dirs_cached(
                                 output_dir,
                                 tuple(current_output_dirs),
-                                sig
+                                sig,
                             )
-
                             st.download_button(
                                 label="📥 Download Current Results (ZIP)",
                                 data=zip_bytes,
                                 file_name="current_results.zip",
                                 mime="application/zip",
-                                key="download_zip_current"
+                                key="download_zip_current",
                             )
-
                         except Exception as e:
                             st.error(f"ZIP creation failed: {e}")
                     else:
                         st.warning("No current output folders found for this run.")
                 else:
                     st.warning("Output folder not found.")
-
             else:
                 st.info("Click 'Start Processing' to see the analysis panels.")
+
+    def _peak_fitting_kwargs(self) -> dict:
+        """Build PeakFitting constructor kwargs from session state."""
+        return {
+            "enable_chunking": st.session_state.get("enable_chunking", True),
+            "chunk_half_width": st.session_state.get("chunk_half_width", 0.5),
+        }
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.2f} s"
+        minutes, secs = divmod(seconds, 60)
+        return f"{int(minutes)} min {secs:.1f} s"
+
+    def _save_chunk_artifacts(
+        self,
+        fitter,
+        file_basename: str,
+        timings: dict | None = None,
+    ) -> None:
+        """Write chunk CSVs to output/{basename}_output for Panel 7."""
+        out_dir = Path("output", file_basename + "_output")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        chunk_result = getattr(fitter, "chunk_result", None)
+        if chunk_result is None:
+            from peak_chunking import ChunkingResult
+
+            n_rows = len(fitter.x) if hasattr(fitter, "x") else 0
+            chunk_result = ChunkingResult(
+                metadata_peaks=[],
+                raw_intervals=[],
+                merged_chunks=[],
+                mask=np.ones(n_rows, dtype=bool) if n_rows else np.array([], dtype=bool),
+                stats={
+                    "n_metadata_peaks": 0,
+                    "n_peak_centers_for_chunking": 0,
+                    "n_raw_chunks": 0,
+                    "n_merged_chunks": 0,
+                    "n_merged_from_overlap": 0,
+                    "fraction_of_rows_in_chunks": 1.0 if n_rows else 0.0,
+                },
+            )
+
+        save_chunk_artifacts(
+            out_dir,
+            chunk_result,
+            half_width=getattr(fitter, "chunk_half_width", 0.5),
+            enable_chunking=getattr(fitter, "enable_chunking", False),
+            timings=timings,
+        )
+
+    def _show_processing_time(self, timings: dict, file_label: str | None = None) -> None:
+        """Display step-by-step processing duration after a run."""
+        prefix = f"**{file_label}** — " if file_label else ""
+        total = timings.get("total_s", 0)
+        st.success(
+            f"{prefix}Processing time: **{self._format_duration(total)}** "
+            f"(setup: {self._format_duration(timings.get('setup_s', 0))}, "
+            f"fitting: {self._format_duration(timings.get('fitting_s', 0))}, "
+            f"post-process: {self._format_duration(timings.get('postprocess_s', 0))})"
+        )
+
+    def _show_chunking_summary(
+        self,
+        fitter=None,
+        file_label: str | None = None,
+        stats: dict | None = None,
+        enable_chunking: bool | None = None,
+    ):
+        """Display metadata-chunking diagnostics after fitting."""
+        if stats is None and fitter is not None:
+            stats = getattr(fitter, "chunk_stats", None)
+            enable_chunking = getattr(fitter, "enable_chunking", False)
+        if not stats or not enable_chunking:
+            return
+
+        prefix = f"**{file_label}** — " if file_label else ""
+        n_meta = stats.get("n_metadata_peaks", stats.get("n_detected_peaks", 0))
+        st.info(
+            f"{prefix}Metadata chunking: "
+            f"{n_meta} metadata peaks, "
+            f"{stats.get('n_raw_chunks', 0)} chunk windows, "
+            f"{stats.get('n_merged_chunks', 0)} merged chunks "
+            f"({stats.get('n_merged_from_overlap', 0)} merged from overlap), "
+            f"{stats.get('fraction_of_rows_in_chunks', 0):.0%} of spectrum rows used for fitting."
+        )
 
     def process_data(self):
         if not self.data_fp or not self.meta_fp:
@@ -787,22 +972,35 @@ class StreamlitApp:
 
         data_path = self._save_uploaded_file(self.data_fp)
         meta_path = self._save_uploaded_file(self.meta_fp)
-        ref_path = self._save_uploaded_file(self.reference_fp) if self.reference_fp else None
+        ref_path = (
+            self._save_uploaded_file(self.reference_fp)
+            if self.reference_fp and st.session_state.get("use_reference", True)
+            else None
+        )
 
         result = run_processing_cached(
             data_path=data_path,
             meta_path=meta_path,
             ref_path=ref_path,
             model_name=st.session_state.get("model_name", "Model 1"),
+            enable_chunking=st.session_state.get("enable_chunking", True),
+            chunk_half_width=float(st.session_state.get("chunk_half_width", 0.5)),
             data_sig=file_signature(data_path),
             meta_sig=file_signature(meta_path),
-            ref_sig=file_signature(ref_path) if ref_path else None
+            ref_sig=file_signature(ref_path) if ref_path else None,
         )
 
         st.session_state["tmp_data_path"] = result["data_path"]
         st.session_state["tmp_meta_path"] = result["meta_path"]
         st.session_state["tmp_ref_path"] = result["ref_path"]
         st.session_state["file_name"] = result["file_name"]
+        st.session_state["processing_timings"] = result["timings"]
+        self._show_processing_time(result["timings"])
+        self._show_chunking_summary(
+            file_label=None,
+            stats=result.get("chunk_stats"),
+            enable_chunking=result.get("enable_chunking"),
+        )
 
     def process_batch(self):
         if not self.meta_fp or not self.data_files:
@@ -810,7 +1008,11 @@ class StreamlitApp:
             return
 
         meta_path = self._save_uploaded_file(self.meta_fp)
-        ref_path = self._save_uploaded_file(self.reference_fp) if self.reference_fp else None
+        ref_path = (
+            self._save_uploaded_file(self.reference_fp)
+            if self.reference_fp and st.session_state.get("use_reference", True)
+            else None
+        )
 
         total_files = len(self.data_files)
         progress_bar = st.progress(0)
@@ -818,6 +1020,8 @@ class StreamlitApp:
 
         successful_files = []
         failed_files = []
+        batch_timings = []
+        batch_t0 = time.perf_counter()
 
         for idx, data_file in enumerate(self.data_files):
             status_text.text(f"Processing file {idx + 1}/{total_files}: {data_file.name}")
@@ -825,19 +1029,25 @@ class StreamlitApp:
 
             try:
                 data_path = self._save_uploaded_file(data_file)
-
-                run_processing_cached(
+                result = run_processing_cached(
                     data_path=data_path,
                     meta_path=meta_path,
                     ref_path=ref_path,
                     model_name=st.session_state.get("model_name", "Model 1"),
+                    enable_chunking=st.session_state.get("enable_chunking", True),
+                    chunk_half_width=float(st.session_state.get("chunk_half_width", 0.5)),
                     data_sig=file_signature(data_path),
                     meta_sig=file_signature(meta_path),
-                    ref_sig=file_signature(ref_path) if ref_path else None
+                    ref_sig=file_signature(ref_path) if ref_path else None,
                 )
-
+                batch_timings.append((data_file.name, result["timings"]))
+                self._show_processing_time(result["timings"], file_label=data_file.name)
+                self._show_chunking_summary(
+                    file_label=data_file.name,
+                    stats=result.get("chunk_stats"),
+                    enable_chunking=result.get("enable_chunking"),
+                )
                 successful_files.append(data_file.name)
-
             except Exception as e:
                 failed_files.append((data_file.name, str(e)))
                 st.error(f"Failed to process {data_file.name}: {str(e)}")
@@ -845,29 +1055,41 @@ class StreamlitApp:
         progress_bar.progress(1.0)
         status_text.empty()
 
+        batch_total = time.perf_counter() - batch_t0
+        st.session_state["processing_timings"] = {
+            "setup_s": sum(t["setup_s"] for _, t in batch_timings),
+            "fitting_s": sum(t["fitting_s"] for _, t in batch_timings),
+            "postprocess_s": sum(t["postprocess_s"] for _, t in batch_timings),
+            "total_s": batch_total,
+            "n_files": len(batch_timings),
+        }
+
         st.success("Batch processing completed!")
+        if batch_timings:
+            self._show_processing_time(
+                st.session_state["processing_timings"],
+                file_label=f"{len(batch_timings)} files",
+            )
 
         col_success, col_failed = st.columns(2)
-
         with col_success:
             st.metric("Successful", len(successful_files))
             if successful_files:
                 with st.expander("View successful files"):
                     for file in successful_files:
                         st.text(file)
-
         with col_failed:
             st.metric("Failed", len(failed_files))
             if failed_files:
                 with st.expander("View failed files"):
                     for file, error in failed_files:
-                        st.text(f"Error: {file}")
+                        st.text(file)
                         st.caption(f"Error: {error}")
 
         st.session_state["batch_results"] = {
             "successful": successful_files,
             "failed": failed_files,
-            "total": total_files
+            "total": total_files,
         }
 
         if successful_files:
@@ -905,7 +1127,7 @@ class StreamlitApp:
                     data_path,
                     file_signature(ref_path),
                     file_signature(meta_path),
-                    data_sig
+                    data_sig,
                 )
                 st.success("Reference processing completed. Results available in mmol.")
             except Exception as e:
@@ -917,6 +1139,12 @@ class StreamlitApp:
                 st.info("Reference processing skipped. Kinetic results remain in arbitrary units (a.u.).")
             else:
                 st.warning("No reference file provided. Panel 4 will be skipped.")
+
+        try:
+            st.session_state["panel_7_obj"] = ChunkRegionsPlot(file_path=data_path)
+        except Exception as e:
+            st.warning(f"Could not load chunk panel: {e}")
+            st.session_state["panel_7_obj"] = None
 
     def panel1(self):
         tmp_data_path = st.session_state.get("tmp_data_path")
@@ -1082,6 +1310,180 @@ class StreamlitApp:
                 button_key=f"panel4_{ref_file_name}_{selected_frame}"
             )
 
+    def panel7(self):
+        tmp_data_path = st.session_state.get("tmp_data_path")
+        if not tmp_data_path:
+            st.error("No processed data found. Please process data first.")
+            return
+
+        panel7_obj = st.session_state.get("panel_7_obj")
+        if panel7_obj is None:
+            try:
+                chunks_fp = Path(
+                    "output",
+                    os.path.splitext(os.path.basename(tmp_data_path))[0] + "_output",
+                    "chunk_regions.csv",
+                )
+                if chunks_fp.exists():
+                    st.session_state["panel_7_obj"] = ChunkRegionsPlot(file_path=tmp_data_path)
+                    panel7_obj = st.session_state["panel_7_obj"]
+                else:
+                    with st.expander("Panel 7 - Peak Fitting Chunks", expanded=False):
+                        st.info(
+                            "Chunk visualization is available after processing with "
+                            "**Enable metadata-based chunking** turned on."
+                        )
+                    return
+            except Exception as e:
+                st.error(f"Failed to load chunk panel: {e}")
+                return
+
+        file_name = os.path.splitext(os.path.basename(tmp_data_path))[0]
+
+        with st.expander("Panel 7 - Peak Fitting Chunks", expanded=True):
+            st.markdown("# Peak Fitting Chunks")
+
+            if not panel7_obj.chunking_enabled:
+                st.warning("Metadata chunking was disabled for this run. Full spectrum was used for fitting.")
+
+            metrics = panel7_obj.summary_metrics()
+            m1, m2, m3, m4, m5 = st.columns(5)
+            n_meta = int(
+                metrics.get("n_metadata_peaks", metrics.get("n_detected_peaks", 0))
+            )
+            m1.metric("Metadata peaks", n_meta)
+            m2.metric("Raw windows", int(metrics.get("n_raw_chunks", 0)))
+            m3.metric("Merged chunks", int(metrics.get("n_merged_chunks", 0)))
+            m4.metric(
+                "Spectrum in chunks",
+                f"{float(metrics.get('fraction_of_rows_in_chunks', 0)):.0%}",
+            )
+            total_s = metrics.get("total_s")
+            m5.metric(
+                "Processing time",
+                self._format_duration(float(total_s)) if total_s is not None else "—",
+            )
+
+            half_w = metrics.get("half_width_ppm")
+            if half_w is not None:
+                st.caption(
+                    f"Chunks built from metadata ppm positions (± {float(half_w):.2f} ppm); "
+                    "overlapping windows are merged automatically."
+                )
+            timings = st.session_state.get("processing_timings")
+            if timings and timings.get("total_s") is not None and metrics.get("total_s") is None:
+                st.caption(
+                    f"Last run: {self._format_duration(timings['total_s'])} "
+                    f"(setup {self._format_duration(timings.get('setup_s', 0))}, "
+                    f"fit {self._format_duration(timings.get('fitting_s', 0))}, "
+                    f"post {self._format_duration(timings.get('postprocess_s', 0))})."
+                )
+
+            n_frames = panel7_obj.n_frames()
+            st.caption(
+                f"This dataset has **{n_frames} time frames**. "
+                "Chunk regions are defined from **metadata ppm positions** "
+                "(± half-width, merged when overlapping) and are the same for every frame."
+            )
+
+            ctrl1, ctrl2 = st.columns(2)
+            with ctrl1:
+                use_mean = st.checkbox(
+                    "Show mean spectrum (all frames averaged)",
+                    value=True,
+                    help="When checked, each chunk plot uses the average of all time columns.",
+                    key=f"panel7_mean_{file_name}",
+                )
+            with ctrl2:
+                frame = 1
+                if n_frames >= 1 and not use_mean:
+                    frame = st.slider(
+                        "Time frame",
+                        min_value=1,
+                        max_value=n_frames,
+                        value=1,
+                        help="Pick one time column for each chunk plot.",
+                        key=f"panel7_frame_{file_name}",
+                    )
+                elif use_mean:
+                    st.caption(f"Display: mean of frames 1–{n_frames}")
+
+            overview_fig = panel7_obj.plot_overview(frame=frame, use_mean=use_mean)
+            chunk_figures = panel7_obj.render_all_chunks(frame=frame, use_mean=use_mean)
+
+            if overview_fig is None and not chunk_figures:
+                st.info("No chunk regions were generated for this run.")
+            else:
+                if overview_fig is not None:
+                    st.markdown("**Full spectrum — chunk regions**")
+                    st.plotly_chart(
+                        overview_fig,
+                        use_container_width=True,
+                        config={"displayModeBar": True},
+                    )
+
+                if chunk_figures:
+                    st.markdown(f"**Individual chunks** ({len(chunk_figures)} merged region(s))")
+                    for fig in chunk_figures:
+                        st.plotly_chart(
+                            fig,
+                            use_container_width=True,
+                            config={"displayModeBar": True},
+                        )
+
+            table = panel7_obj.chunks_table()
+            if table is not None and not table.empty:
+                st.markdown("**Chunk boundaries (ppm)**")
+                st.dataframe(
+                    table.style.format(
+                        {"ppm_low": "{:.4f}", "ppm_high": "{:.4f}", "width_ppm": "{:.4f}"}
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            peaks_display = panel7_obj.metadata_peaks_display_df()
+            if peaks_display is not None and not peaks_display.empty:
+                st.markdown("**Metadata peaks**")
+                st.dataframe(
+                    peaks_display.rename(
+                        columns={"peak_name": "Peak name", "peak_ppm": "Peak position (ppm)"}
+                    ).style.format({"Peak position (ppm)": "{:.2f}"}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            export_format = st.selectbox(
+                "Choose export format",
+                options=["PNG", "JPG", "PDF"],
+                index=0,
+                key=f"panel7_export_format_{file_name}",
+            )
+            export_options = []
+            if overview_fig is not None:
+                export_options.append(("Full spectrum — chunk regions", overview_fig))
+            for i, fig in enumerate(chunk_figures):
+                export_options.append(
+                    (fig.layout.title.text or f"Chunk {i + 1}", fig)
+                )
+
+            if export_options:
+                export_labels = [label for label, _ in export_options]
+                export_chunk = st.selectbox(
+                    "Export plot",
+                    options=export_labels,
+                    key=f"panel7_export_chunk_{file_name}",
+                )
+                fig_to_save = next(fig for label, fig in export_options if label == export_chunk)
+                self.save_plot_with_format(
+                    session_obj=panel7_obj,
+                    fig=fig_to_save,
+                    file_basename=file_name,
+                    file_name=f"Chunks_{file_name}_{export_chunk.replace(' ', '_')[:40]}",
+                    button_key=f"panel7_{file_name}_{export_chunk}",
+                    selected_format=export_format,
+                )
+
     def panel6(self):
         data_path = st.session_state.get("tmp_data_path")
 
@@ -1228,24 +1630,51 @@ class StreamlitApp:
         with about:
             st.markdown(
                 """
-                ### Instructions
+                ### Instructions:
 
-                1. Select model.
-                2. Upload metadata, spectrum, and optional reference file.
-                3. Press Start Processing.
-                4. Enable only the panel you want to inspect.
-                5. Change plot settings and click Apply.
-                6. Select export format(s) and download results.
+                #### Step 0:
+                **Choose the Model:**
 
-                ### Waterfall Plot Options
+                **Model 1:**
+                Lorenzian curve fitting with parameters of the Meta Description
 
-                - Raw only
-                - Fitted only
-                - Raw + fitted
-                - Diff only
-                - Select spectra/time-point range
-                - Adjust viewing angles
-                - Apply smoothing
+                **Model 2:**
+                Lorenzian curve fitting + initial parameters derived from actual spectrum
+
+                #### Step 1:
+                - **Select the Metadata**
+                - **Select the Substrate**
+                - **Select the Reference File**
+
+                #### Step 2:
+                - Click Start Processing
+
+                #### Step 3:
+                ##### Substrate Plot
+                - Use sliders to select the frame
+                - Use the legend to show or hide lines
+                - Select export format before saving
+
+                #### Kinetic Plot
+                - Kinetics of metabolites and substrate peaks
+                - Select export format before saving
+
+                #### Contour Plot
+                - Visualize the full measured spectrum and select the depth [%]
+                - Select export format before saving
+
+                #### Stacked Spectra Plot
+                - Visualize multiple spectra stacked vertically
+                - Adjust frame range and spacing
+                - Select export format before saving
+
+                #### Peak Chunks Plot (Panel 7)
+                - View each merged metadata chunk in a zoomed spectrum plot
+                - Read chunk ppm boundaries in the table below the plots
+
+                #### Reference Plot
+                - Get the reference value on water
+                - Select export format before saving
                 """
             )
 
