@@ -1,3 +1,4 @@
+import io
 import os
 import tempfile
 import time
@@ -8,7 +9,6 @@ import pandas as pd
 import plotly.io as pio
 import streamlit as st
 
-import io
 import nmrglue as ng
 import numpy as np
 from scipy.signal import find_peaks
@@ -27,6 +27,7 @@ from panel5_reference_plot import Reference
 from panel6_stacked_plot import StackedSpectraPlot
 from panel7_chunk_plot import ChunkRegionsPlot
 from peak_chunking import save_chunk_artifacts
+
 
 st.set_page_config(layout="wide", page_title="SBMI - Application", page_icon=":shark:")
 
@@ -100,7 +101,38 @@ def file_signature(path):
     return None
 
 
+def output_folder_signature(folder_path):
+    if not os.path.exists(folder_path):
+        return None
+
+    sig = []
+    for root, _, files in os.walk(folder_path):
+        for file in files:
+            p = os.path.join(root, file)
+            try:
+                sig.append((p, os.path.getmtime(p), os.path.getsize(p)))
+            except OSError:
+                pass
+    return tuple(sig)
+
+
+@st.cache_data(show_spinner=False)
+def create_zip_bytes_cached(folder_path, folder_signature):
+    zip_buffer = io.BytesIO()
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                full_path = os.path.join(root, file)
+                arcname = os.path.relpath(full_path, folder_path)
+                zip_file.write(full_path, arcname)
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+
 def selected_output_dirs_signature(output_dirs):
+    """Signature only for the output folders belonging to the current run."""
     sig = []
     for folder_path in output_dirs:
         if not os.path.exists(folder_path):
@@ -117,7 +149,10 @@ def selected_output_dirs_signature(output_dirs):
 
 @st.cache_data(show_spinner=False)
 def create_zip_selected_dirs_cached(output_root, output_dirs, folder_signature):
-    """ZIP only the output folders from the current run (not older experiments)."""
+    """
+    Create ZIP only from the result folders of the current experiment/run.
+    This prevents old batch results from being included in later downloads.
+    """
     zip_buffer = io.BytesIO()
     output_root = os.path.abspath(output_root)
 
@@ -125,6 +160,7 @@ def create_zip_selected_dirs_cached(output_root, output_dirs, folder_signature):
         for folder_path in output_dirs:
             if not os.path.exists(folder_path):
                 continue
+
             for root, _, files in os.walk(folder_path):
                 for file in files:
                     full_path = os.path.join(root, file)
@@ -214,7 +250,11 @@ def run_processing_cached(
 
     if ref_path and os.path.exists(ref_path):
         try:
-            ref_processor = Reference(fp_ref=ref_path, fp_meta=meta_path, fp_data=data_path)
+            ref_processor = Reference(
+                fp_ref=ref_path,
+                fp_meta=meta_path,
+                fp_data=data_path
+            )
             ref_processor.save_kinetics_mmol()
         except Exception:
             pass
@@ -258,11 +298,233 @@ def get_reference_cached(ref_path, meta_path, data_path, ref_sig, meta_sig, data
 
 
 class StreamlitApp:
-    def __init__(self, fig1=None, fig2=None, fig3=None, fig4=None):
-        self.fig1 = fig1
-        self.fig2 = fig2
-        self.fig3 = fig3
-        self.fig4 = fig4
+    def __init__(self):
+        pass
+
+    def _get_upload_dir(self):
+        upload_dir = Path("runtime_uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        return upload_dir
+
+    def _save_uploaded_file(self, uploaded_file):
+        upload_dir = self._get_upload_dir()
+        target_path = upload_dir / uploaded_file.name
+
+        with open(target_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+
+        return str(target_path.resolve())
+
+    def safe_frame_slider(self, label, n_frames, default=1):
+        if n_frames <= 1:
+            st.info("Only one frame available.")
+            return 1
+
+        return st.slider(
+            label,
+            min_value=1,
+            max_value=n_frames,
+            value=min(default, n_frames)
+        )
+
+    def save_matplotlib_formats(
+        self,
+        session_obj=None,
+        fig=None,
+        file_basename=None,
+        file_name=None,
+        button_key=None
+    ):
+        if fig is None:
+            st.error("No figure available for export.")
+            return
+
+        if file_basename is None:
+            file_basename = "plot"
+
+        if file_name is None:
+            file_name = "plot"
+
+        if button_key is None:
+            button_key = file_name
+
+        plot_dir = Path("output", file_basename + "_output", "plots")
+        os.makedirs(plot_dir, exist_ok=True)
+
+        st.markdown("**Select export format(s)**")
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            save_pdf = st.checkbox("PDF", key=f"pdf_{button_key}")
+        with c2:
+            save_png = st.checkbox("PNG", key=f"png_{button_key}")
+        with c3:
+            save_jpg = st.checkbox("JPG", key=f"jpg_{button_key}")
+
+        if st.button("Save Selected Format(s)", key=f"save_btn_{button_key}"):
+            if not (save_pdf or save_png or save_jpg):
+                st.warning("Please select at least one format.")
+                return
+
+            saved_files = []
+
+            try:
+                if save_pdf:
+                    pdf_path = Path(plot_dir, f"{file_name}_{file_basename}.pdf")
+                    fig.savefig(str(pdf_path), format="pdf", bbox_inches="tight")
+                    saved_files.append(str(pdf_path))
+
+                if save_png:
+                    png_path = Path(plot_dir, f"{file_name}_{file_basename}.png")
+                    fig.savefig(str(png_path), format="png", dpi=180, bbox_inches="tight")
+                    saved_files.append(str(png_path))
+
+                if save_jpg:
+                    jpg_path = Path(plot_dir, f"{file_name}_{file_basename}.jpg")
+                    fig.savefig(str(jpg_path), format="jpeg", dpi=180, bbox_inches="tight")
+                    saved_files.append(str(jpg_path))
+
+                st.session_state[f"saved_files_{button_key}"] = saved_files
+                st.success("Selected format(s) saved successfully.")
+
+            except Exception as e:
+                st.error(f"Failed to save selected format(s): {e}")
+
+        saved_files = st.session_state.get(f"saved_files_{button_key}", [])
+
+        if saved_files:
+            mime_map = {
+                ".pdf": "application/pdf",
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg"
+            }
+
+            for idx, saved_file in enumerate(saved_files):
+                if os.path.exists(saved_file):
+                    with open(saved_file, "rb") as f:
+                        ext = Path(saved_file).suffix.lower()
+                        st.download_button(
+                            label=f"Download {Path(saved_file).name}",
+                            data=f.read(),
+                            file_name=os.path.basename(saved_file),
+                            mime=mime_map.get(ext, "application/octet-stream"),
+                            key=f"download_{button_key}_{idx}"
+                        )
+
+    def save_plotly_formats(self, fig, file_basename, file_name, button_key):
+        plot_dir = Path("output", file_basename + "_output", "plots")
+        os.makedirs(plot_dir, exist_ok=True)
+
+        st.markdown("**Select export format(s)**")
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            save_pdf = st.checkbox("PDF", key=f"plotly_pdf_{button_key}")
+        with c2:
+            save_png = st.checkbox("PNG", key=f"plotly_png_{button_key}")
+        with c3:
+            save_jpg = st.checkbox("JPG", key=f"plotly_jpg_{button_key}")
+
+        if st.button("Save Selected Format(s)", key=f"plotly_save_btn_{button_key}"):
+            if not (save_pdf or save_png or save_jpg):
+                st.warning("Please select at least one format.")
+                return
+
+            saved_files = []
+
+            try:
+                if save_pdf:
+                    pdf_path = Path(plot_dir, f"{file_name}_{file_basename}.pdf")
+                    pio.write_image(fig, str(pdf_path), format="pdf", engine="kaleido", width=1000, height=650)
+                    saved_files.append(str(pdf_path))
+
+                if save_png:
+                    png_path = Path(plot_dir, f"{file_name}_{file_basename}.png")
+                    pio.write_image(fig, str(png_path), format="png", engine="kaleido", width=1000, height=650)
+                    saved_files.append(str(png_path))
+
+                if save_jpg:
+                    jpg_path = Path(plot_dir, f"{file_name}_{file_basename}.jpg")
+                    pio.write_image(fig, str(jpg_path), format="jpg", engine="kaleido", width=1000, height=650)
+                    saved_files.append(str(jpg_path))
+
+                st.session_state[f"plotly_saved_files_{button_key}"] = saved_files
+                st.success("Selected format(s) saved successfully.")
+
+            except Exception as e:
+                st.error(f"Failed to export Plotly figure: {e}")
+
+        saved_files = st.session_state.get(f"plotly_saved_files_{button_key}", [])
+
+        if saved_files:
+            mime_map = {
+                ".pdf": "application/pdf",
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg"
+            }
+
+            for idx, saved_file in enumerate(saved_files):
+                if os.path.exists(saved_file):
+                    with open(saved_file, "rb") as f:
+                        ext = Path(saved_file).suffix.lower()
+                        st.download_button(
+                            label=f"Download {Path(saved_file).name}",
+                            data=f.read(),
+                            file_name=os.path.basename(saved_file),
+                            mime=mime_map.get(ext, "application/octet-stream"),
+                            key=f"plotly_download_{button_key}_{idx}"
+                        )
+
+    def save_plot_with_format(self, session_obj, fig, file_basename, file_name, button_key, selected_format):
+        plot_dir = Path("output", file_basename + "_output", "plots")
+        os.makedirs(plot_dir, exist_ok=True)
+
+        ext = selected_format.lower()
+        save_path = Path(plot_dir, f"{file_name}_{file_basename}.{ext}")
+
+        if st.button(f"Save as {selected_format}", key=f"save_{button_key}_{ext}"):
+            if ext == "pdf":
+                session_obj.save_fig(fig=fig, name=save_path.with_suffix(""))
+            elif ext in ["png", "jpg", "jpeg"]:
+                if hasattr(fig, "write_image"):
+                    plotly_format = "jpeg" if ext == "jpg" else ext
+                    fig.write_image(
+                        str(save_path),
+                        format=plotly_format,
+                        engine="kaleido",
+                        width=1000,
+                        height=700,
+                        scale=1
+                    )
+                else:
+                    matplotlib_format = "jpeg" if ext == "jpg" else ext
+                    fig.savefig(str(save_path), format=matplotlib_format, dpi=300, bbox_inches="tight")
+            else:
+                st.error(f"Unsupported format: {selected_format}")
+                return
+
+            st.session_state[f"saved_file_{button_key}"] = str(save_path)
+            st.success(f"Saved: {save_path}")
+
+        saved_file = st.session_state.get(f"saved_file_{button_key}")
+        if saved_file and os.path.exists(saved_file):
+            mime_map = {
+                "pdf": "application/pdf",
+                "png": "image/png",
+                "jpg": "image/jpeg",
+                "jpeg": "image/jpeg"
+            }
+            ext_saved = Path(saved_file).suffix.lower().replace(".", "")
+            with open(saved_file, "rb") as f:
+                st.download_button(
+                    label=f"Download {Path(saved_file).name}",
+                    data=f.read(),
+                    file_name=os.path.basename(saved_file),
+                    mime=mime_map.get(ext_saved, "application/octet-stream"),
+                    key=f"download_{button_key}_{ext_saved}"
+                )
 
     def _pick_folder(self, title):
         if sys.platform == "win32":
@@ -393,7 +655,6 @@ class StreamlitApp:
                 st.markdown("**Step 1: Select the Metadata as .xlsx**")
                 self.meta_fp = st.file_uploader("Step 1: Upload Metadata (.xlsx)", type=["xlsx"], key="meta_file")
 
-# Select the Spectrum as csv 
                 if input_source == "CSV":
                     if not batch_mode:
                         st.markdown('**Step 2: Select Spectrum as .csv**')
@@ -401,7 +662,6 @@ class StreamlitApp:
                         self.data_files = [self.data_fp] if self.data_fp else []
 
                     else:
-                    # BATCH MODE - Multiple Files
                         st.markdown('**Step 2: Select Multiple Spectra as .csv**')
                         uploaded_files = st.file_uploader(
                             "Upload multiple Spectrum files (.csv)",
@@ -526,6 +786,23 @@ class StreamlitApp:
 
         self.about_page(about)
 
+    def get_current_output_dirs(self, output_root):
+        """Output folders for the current single-file or batch run only."""
+        output_dirs = []
+
+        if st.session_state.get("batch_mode", False) and st.session_state.get("batch_results"):
+            for filename in st.session_state["batch_results"].get("successful", []):
+                base_name = os.path.splitext(os.path.basename(filename))[0]
+                folder_path = os.path.join(output_root, f"{base_name}_output")
+                if os.path.exists(folder_path):
+                    output_dirs.append(folder_path)
+        elif st.session_state.get("file_name"):
+            folder_path = os.path.join(output_root, f"{st.session_state['file_name']}_output")
+            if os.path.exists(folder_path):
+                output_dirs.append(folder_path)
+
+        return output_dirs
+
     def main_page(self, main):
         with main:
             st.markdown("#### Main Page Content")
@@ -599,35 +876,6 @@ class StreamlitApp:
                     st.warning("Output folder not found.")
             else:
                 st.info("Click 'Start Processing' to see the analysis panels.")
-
-    def _get_upload_dir(self):
-        upload_dir = Path("runtime_uploads")
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        return upload_dir
-
-    def _save_uploaded_file(self, uploaded_file):
-        upload_dir = self._get_upload_dir()
-        target_path = upload_dir / uploaded_file.name
-        with open(target_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        return str(target_path.resolve())
-
-    def get_current_output_dirs(self, output_root):
-        """Output folders for the current single-file or batch run only."""
-        output_dirs = []
-
-        if st.session_state.get("batch_mode", False) and st.session_state.get("batch_results"):
-            for filename in st.session_state["batch_results"].get("successful", []):
-                base_name = os.path.splitext(os.path.basename(filename))[0]
-                folder_path = os.path.join(output_root, f"{base_name}_output")
-                if os.path.exists(folder_path):
-                    output_dirs.append(folder_path)
-        elif st.session_state.get("file_name"):
-            folder_path = os.path.join(output_root, f"{st.session_state['file_name']}_output")
-            if os.path.exists(folder_path):
-                output_dirs.append(folder_path)
-
-        return output_dirs
 
     def _peak_fitting_kwargs(self) -> dict:
         """Build PeakFitting constructor kwargs from session state."""
@@ -898,176 +1146,54 @@ class StreamlitApp:
             st.warning(f"Could not load chunk panel: {e}")
             st.session_state["panel_7_obj"] = None
 
-    def about_page(self, about):
-        with about:
-            st.markdown(
-                """
-                ### Instructions:
-
-                #### Step 0:
-                **Choose the Model:**
-
-                **Model 1:**
-                Lorenzian curve fitting with parameters of the Meta Description
-
-                **Model 2:**
-                Lorenzian curve fitting + initial parameters derived from actual spectrum
-
-                #### Step 1:
-                - **Select the Metadata**
-                - **Select the Substrate**
-                - **Select the Reference File**
-
-                #### Step 2:
-                - Click Start Processing
-
-                #### Step 3:
-                ##### Substrate Plot
-                - Use sliders to select the frame
-                - Use the legend to show or hide lines
-                - Select export format before saving
-
-                #### Kinetic Plot
-                - Kinetics of metabolites and substrate peaks
-                - Select export format before saving
-
-                #### Contour Plot
-                - Visualize the full measured spectrum and select the depth [%]
-                - Select export format before saving
-
-                #### Stacked Spectra Plot
-                - Visualize multiple spectra stacked vertically
-                - Adjust frame range and spacing
-                - Select export format before saving
-
-                #### Peak Chunks Plot (Panel 7)
-                - View each merged metadata chunk in a zoomed spectrum plot
-                - Read chunk ppm boundaries in the table below the plots
-
-                #### Reference Plot
-                - Get the reference value on water
-                - Select export format before saving
-                """
-            )
-        return None
-
-    def safe_frame_slider(self, label, n_frames, default=1):
-        if n_frames <= 1:
-            st.info("Only one frame available.")
-            return 1
-
-        return st.slider(
-            label,
-            min_value=1,
-            max_value=n_frames,
-            value=min(default, n_frames)
-        )
-
-    def save_plot_with_format(self, session_obj, fig, file_basename, file_name, button_key, selected_format):
-        plot_dir = Path("output", file_basename + "_output", "plots")
-        os.makedirs(plot_dir, exist_ok=True)
-
-        ext = selected_format.lower()
-        save_path = Path(plot_dir, f"{file_name}_{file_basename}.{ext}")
-
-        if st.button(f"Save as {selected_format}", key=f"save_{button_key}_{ext}"):
-            if ext == "pdf":
-                session_obj.save_fig(fig=fig, name=save_path.with_suffix(""))
-            elif ext in ["png", "jpg", "jpeg"]:
-                if hasattr(fig, "write_image"):
-                    plotly_format = "jpeg" if ext == "jpg" else ext
-                    fig.write_image(
-                        str(save_path),
-                        format=plotly_format,
-                        engine="kaleido",
-                        width=1000,
-                        height=700,
-                        scale=1
-                    )
-                else:
-                    matplotlib_format = "jpeg" if ext == "jpg" else ext
-                    fig.savefig(str(save_path), format=matplotlib_format, dpi=300, bbox_inches="tight")
-            else:
-                st.error(f"Unsupported format: {selected_format}")
-                return
-
-            st.session_state[f"saved_file_{button_key}"] = str(save_path)
-            st.success(f"Saved: {save_path}")
-
-        saved_file = st.session_state.get(f"saved_file_{button_key}")
-        if saved_file and os.path.exists(saved_file):
-            mime_map = {
-                "pdf": "application/pdf",
-                "png": "image/png",
-                "jpg": "image/jpeg",
-                "jpeg": "image/jpeg"
-            }
-            ext_saved = Path(saved_file).suffix.lower().replace(".", "")
-            with open(saved_file, "rb") as f:
-                st.download_button(
-                    label=f"Download {Path(saved_file).name}",
-                    data=f.read(),
-                    file_name=os.path.basename(saved_file),
-                    mime=mime_map.get(ext_saved, "application/octet-stream"),
-                    key=f"download_{button_key}_{ext_saved}"
-                )
-
     def panel1(self):
-        try:
-            tmp_data_path = st.session_state.get("tmp_data_path")
-            if not tmp_data_path:
-                st.error("No processed data found. Please process data first.")
-                return
+        tmp_data_path = st.session_state.get("tmp_data_path")
 
-            file_name = os.path.splitext(os.path.basename(tmp_data_path))[0]
-            sum_fit_fp = Path("output", f"{file_name}_output", "sum_fit.csv")
-            pd.read_csv(sum_fit_fp)
-
-        except Exception as e:
-            st.markdown(
-                """
-                <span style="color:red; font-size:72px;">Please Press 'Start Processing !'</span>
-                """,
-                unsafe_allow_html=True
-            )
-            st.error(f"Error loading data: {str(e)}")
+        if not tmp_data_path or not os.path.exists(tmp_data_path):
+            st.error("No processed data found. Please process data first.")
             return
 
         if "panel_1_obj" not in st.session_state or st.session_state["panel_1_obj"] is None:
             st.error("Panel 1 object not initialized. Please process data first.")
             return
 
+        file_name = os.path.splitext(os.path.basename(tmp_data_path))[0]
+
         with st.expander("Panel 1 - Substrate Plot", expanded=True):
             panel1_obj = st.session_state["panel_1_obj"]
             data = panel1_obj.data
             diffs = panel1_obj.differences
 
-            n_cols_data = data.shape[1]
-            n_frames_data = max(n_cols_data - 1, 0)
+            n_frames_data = max(data.shape[1] - 1, 0)
 
             if n_frames_data < 1:
-                st.info("Panel 1: No time frames found (only x-axis).")
+                st.info("Panel 1: No time frames found.")
                 return
 
-            time_frame = st.slider(
-                "Select the frame",
-                min_value=1,
-                max_value=n_frames_data,
-                value=1,
-            )
-            st.session_state["time_frame"] = time_frame
+            with st.form(f"panel1_form_{file_name}"):
+                time_frame = st.slider(
+                    "Select the frame",
+                    min_value=1,
+                    max_value=n_frames_data,
+                    value=st.session_state.get(f"panel1_frame_{file_name}", 1),
+                )
+                apply_panel1 = st.form_submit_button("Apply Panel 1 Settings")
+
+            if apply_panel1 or f"panel1_frame_{file_name}" not in st.session_state:
+                st.session_state[f"panel1_frame_{file_name}"] = time_frame
+
+            selected_frame = st.session_state.get(f"panel1_frame_{file_name}", 1)
 
             st.markdown("# Substrate Plot")
 
             noise_std_text = "n/a"
-            if isinstance(diffs, pd.DataFrame) and diffs.shape[1] > time_frame:
-                noise_std = diffs.iloc[:, time_frame].std()
+            if isinstance(diffs, pd.DataFrame) and diffs.shape[1] > selected_frame:
+                noise_std = diffs.iloc[:, selected_frame].std()
                 noise_std_text = f"{noise_std:.3f}"
 
             st.write(f"Standard deviation of noise: {noise_std_text}")
 
-            one_plot = panel1_obj.plot(time_frame)
-            file_name = os.path.splitext(os.path.basename(tmp_data_path))[0]
+            one_plot = panel1_obj.plot(selected_frame)
 
             st.plotly_chart(
                 one_plot,
@@ -1075,34 +1201,24 @@ class StreamlitApp:
                 config={"displayModeBar": True}
             )
 
-            export_format = st.selectbox(
-                "Choose export format",
-                options=["JPG", "PNG", "PDF"],
-                index=0,
-                key=f"panel1_export_format_{file_name}_{time_frame}"
-            )
-
-            self.save_plot_with_format(
-                session_obj=st.session_state["panel_1_obj"],
+            self.save_plotly_formats(
                 fig=one_plot,
                 file_basename=file_name,
-                file_name=f"Substrate_{file_name}_{time_frame}",
-                button_key=f"panel1_{file_name}_{time_frame}",
-                selected_format=export_format
+                file_name=f"Substrate_{file_name}_{selected_frame}",
+                button_key=f"panel1_{file_name}_{selected_frame}"
             )
 
+
     def panel2(self):
+        tmp_data_path = st.session_state.get("tmp_data_path")
+
         if "panel_2_obj" not in st.session_state or st.session_state["panel_2_obj"] is None:
             st.error("Panel 2 object not initialized. Please process data first.")
             return
 
-        tmp_data_path = st.session_state.get("tmp_data_path")
-        if not tmp_data_path:
-            st.error("No processed data found. Please process data first.")
-            return
-
         with st.expander("Panel 2 - Kinetic Plot", expanded=True):
             st.markdown("# Kinetic Plot")
+
             fig = st.session_state["panel_2_obj"].plot()
             file_name = os.path.splitext(os.path.basename(tmp_data_path))[0]
 
@@ -1112,91 +1228,86 @@ class StreamlitApp:
                 config={"displayModeBar": True}
             )
 
-            export_format = st.selectbox(
-                "Choose export format",
-                options=["JPG", "PNG", "PDF"],
-                index=0,
-                key=f"panel2_export_format_{file_name}"
-            )
-
-            self.save_plot_with_format(
-                session_obj=st.session_state["panel_2_obj"],
+            self.save_plotly_formats(
                 fig=fig,
                 file_basename=file_name,
                 file_name=f"Kinetic_{file_name}",
-                button_key=f"panel2_{file_name}",
-                selected_format=export_format
+                button_key=f"panel2_{file_name}"
             )
 
     def panel3(self):
+        tmp_data_path = st.session_state.get("tmp_data_path")
+
         if "panel_3_obj" not in st.session_state or st.session_state["panel_3_obj"] is None:
             st.error("Panel 3 object not initialized. Please process data first.")
             return
 
-        tmp_data_path = st.session_state.get("tmp_data_path")
-        if not tmp_data_path:
-            st.error("No processed data found. Please process data first.")
-            return
+        file_name = os.path.splitext(os.path.basename(tmp_data_path))[0]
 
         with st.expander("Panel 3 - Contour Plot", expanded=True):
             st.markdown("# Contour Plot")
-            zmin_zmax = st.slider("Select Zmin and Zmax", min_value=0.0, max_value=1.0, value=(0.0, 1.0))
-            contourplot = st.session_state["panel_3_obj"].plot(zmin=zmin_zmax[0], zmax=zmin_zmax[1])
-            st.pyplot(contourplot, clear_figure=False)
 
-            file_name = os.path.splitext(os.path.basename(tmp_data_path))[0]
+            with st.form(f"panel3_form_{file_name}"):
+                zmin_zmax = st.slider(
+                    "Select Zmin and Zmax",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=st.session_state.get(f"panel3_zrange_{file_name}", (0.0, 1.0))
+                )
+                apply_panel3 = st.form_submit_button("Apply Panel 3 Settings")
 
-            export_format = st.selectbox(
-                "Choose export format",
-                options=["PDF", "PNG", "JPG"],
-                index=0,
-                key=f"panel3_export_format_{file_name}_{zmin_zmax[0]}_{zmin_zmax[1]}"
+            if apply_panel3 or f"panel3_zrange_{file_name}" not in st.session_state:
+                st.session_state[f"panel3_zrange_{file_name}"] = zmin_zmax
+
+            selected_zrange = st.session_state.get(f"panel3_zrange_{file_name}", (0.0, 1.0))
+
+            contourplot = st.session_state["panel_3_obj"].plot(
+                zmin=selected_zrange[0],
+                zmax=selected_zrange[1]
             )
 
-            self.save_plot_with_format(
+            st.pyplot(contourplot, clear_figure=False)
+
+            self.save_matplotlib_formats(
                 session_obj=st.session_state["panel_3_obj"],
                 fig=contourplot,
                 file_basename=file_name,
-                file_name=f"Contour_{file_name}_{zmin_zmax[0]}_{zmin_zmax[1]}",
-                button_key=f"panel3_{file_name}_{zmin_zmax[0]}_{zmin_zmax[1]}",
-                selected_format=export_format
+                file_name=f"Contour_{file_name}_{selected_zrange[0]}_{selected_zrange[1]}",
+                button_key=f"panel3_{file_name}_{selected_zrange[0]}_{selected_zrange[1]}"
             )
 
     def panel4(self):
+        tmp_ref_path = st.session_state.get("tmp_ref_path")
+
         if "panel_4_obj" not in st.session_state or st.session_state["panel_4_obj"] is None:
-            st.warning("Panel 4: No reference data available. Please upload a reference file.")
+            st.warning("Panel 4: No reference data available.")
             return
 
-        tmp_ref_path = st.session_state.get("tmp_ref_path")
-        if not tmp_ref_path:
-            st.warning("No reference file uploaded.")
-            return
+        ref_file_name = os.path.splitext(os.path.basename(tmp_ref_path))[0]
 
         with st.expander("Panel 4 - Reference", expanded=True):
             st.markdown("# Reference")
 
             n_frames = st.session_state["panel_4_obj"].data.shape[1] - 1
-            i = self.safe_frame_slider("Select the frame for water reference", n_frames)
 
-            reference_plot = st.session_state["panel_4_obj"].plot(i=i)
+            with st.form(f"panel4_form_{ref_file_name}"):
+                i = self.safe_frame_slider("Select the frame for water reference", n_frames)
+                apply_panel4 = st.form_submit_button("Apply Panel 4 Settings")
+
+            if apply_panel4 or f"panel4_frame_{ref_file_name}" not in st.session_state:
+                st.session_state[f"panel4_frame_{ref_file_name}"] = i
+
+            selected_frame = st.session_state.get(f"panel4_frame_{ref_file_name}", 1)
+
+            reference_plot = st.session_state["panel_4_obj"].plot(i=selected_frame)
             st.pyplot(reference_plot)
 
-            ref_file_name = os.path.splitext(os.path.basename(tmp_ref_path))[0]
-
-            export_format = st.selectbox(
-                "Choose export format",
-                options=["PDF", "PNG", "JPG"],
-                index=0,
-                key=f"panel4_export_format_{ref_file_name}_{i}"
-            )
-
-            self.save_plot_with_format(
+            self.save_matplotlib_formats(
                 session_obj=st.session_state["panel_4_obj"],
                 fig=reference_plot,
                 file_basename=ref_file_name,
-                file_name=f"Reference_{ref_file_name}_{i}",
-                button_key=f"panel4_{ref_file_name}_{i}",
-                selected_format=export_format
+                file_name=f"Reference_{ref_file_name}_{selected_frame}",
+                button_key=f"panel4_{ref_file_name}_{selected_frame}"
             )
 
     def panel7(self):
@@ -1374,80 +1485,202 @@ class StreamlitApp:
                 )
 
     def panel6(self):
-        data_path = st.session_state.get("tmp_data_path", None)
-        panel6_obj = st.session_state.get("panel_6_obj", None)
+        data_path = st.session_state.get("tmp_data_path")
 
-        if panel6_obj is None:
-            if data_path and os.path.exists(data_path):
-                try:
-                    st.session_state["panel_6_obj"] = StackedSpectraPlot(file_path=data_path)
-                    panel6_obj = st.session_state["panel_6_obj"]
-                except Exception as e:
-                    st.error(f"Failed to initialize Panel 6 object: {e}")
-                    return
-            else:
-                st.error("Panel 6 object not initialized. Please process data first.")
-                return
-
-        if not data_path:
-            st.error("No processed data found. Please process data first.")
+        if "panel_6_obj" not in st.session_state or st.session_state["panel_6_obj"] is None:
+            st.error("Panel 6 object not initialized. Please process data first.")
             return
 
-        with st.expander("Panel 6 - Stacked Spectra (Waterfall Plot)", expanded=True):
-            st.markdown("# Stacked Spectra")
+        file_name = os.path.splitext(os.path.basename(data_path))[0]
+        panel6_obj = st.session_state["panel_6_obj"]
+        max_timepoints = panel6_obj.n_timepoints
 
-            col1, col2, col3 = st.columns(3)
+        with st.expander("Panel 6 - Waterfall Plot", expanded=True):
+            st.markdown("# Waterfall Plot")
 
-            with col1:
-                show_fit = st.checkbox("Show fitted spectra", value=False)
+            with st.form(f"panel6_form_{file_name}"):
 
-            with col2:
-                show_every_nth = st.slider("Show every n-th timepoint", 1, 10, 1)
+                plot_mode = st.selectbox(
+                    "Select waterfall display mode",
+                    options=[
+                        "Raw only",
+                        "Fitted only",
+                        "Raw + fitted",
+                        "Diff only"
+                    ],
+                    index=[
+                        "Raw only",
+                        "Fitted only",
+                        "Raw + fitted",
+                        "Diff only"
+                    ].index(st.session_state.get(f"panel6_mode_{file_name}", "Raw + fitted"))
+                )
 
-            with col3:
-                spacing_factor = st.slider("Vertical spacing", 0.5, 3.0, 1.5, step=0.1)
+                time_range = st.slider(
+                    "Select spectra/time-point range",
+                    min_value=1,
+                    max_value=max_timepoints,
+                    value=st.session_state.get(
+                        f"panel6_time_range_{file_name}",
+                        (1, min(max_timepoints, 50))
+                    )
+                )
 
-            max_intensity = st.session_state["panel_6_obj"].data.iloc[:, 1:].max().max()
-            spacing = max_intensity * spacing_factor
+                col1, col2, col3, col4 = st.columns(4)
 
-            fig = st.session_state["panel_6_obj"].plot_plotly(
-                spacing=spacing,
-                show_fit=show_fit,
-                show_every_nth=show_every_nth
+                with col1:
+                    show_every_nth = st.slider(
+                        "Show every n-th timepoint",
+                        1,
+                        10,
+                        st.session_state.get(f"panel6_every_{file_name}", 3)
+                    )
+
+                with col2:
+                    azim = st.slider(
+                        "Horizontal angle (°)",
+                        min_value=0,
+                        max_value=360,
+                        value=st.session_state.get(f"panel6_azim_{file_name}", 45),
+                        step=5
+                    )
+
+                with col3:
+                    elev = st.slider(
+                        "Vertical angle (°)",
+                        min_value=5,
+                        max_value=90,
+                        value=st.session_state.get(f"panel6_elev_{file_name}", 25),
+                        step=5
+                    )
+
+                with col4:
+                    smooth = st.checkbox(
+                        "Apply smoothing",
+                        value=st.session_state.get(f"panel6_smooth_{file_name}", True)
+                    )
+
+                smooth_window = st.slider(
+                    "Smoothing window",
+                    3,
+                    15,
+                    st.session_state.get(f"panel6_smooth_window_{file_name}", 5),
+                    step=2
+                )
+
+                apply_panel6 = st.form_submit_button("Apply Waterfall Settings")
+
+            if apply_panel6 or f"panel6_ready_{file_name}" not in st.session_state:
+                st.session_state[f"panel6_mode_{file_name}"] = plot_mode
+                st.session_state[f"panel6_time_range_{file_name}"] = time_range
+                st.session_state[f"panel6_every_{file_name}"] = show_every_nth
+                st.session_state[f"panel6_azim_{file_name}"] = azim
+                st.session_state[f"panel6_elev_{file_name}"] = elev
+                st.session_state[f"panel6_smooth_{file_name}"] = smooth
+                st.session_state[f"panel6_smooth_window_{file_name}"] = smooth_window
+                st.session_state[f"panel6_ready_{file_name}"] = True
+
+            selected_mode = st.session_state.get(f"panel6_mode_{file_name}", "Raw + fitted")
+            selected_range = st.session_state.get(f"panel6_time_range_{file_name}", (1, min(max_timepoints, 50)))
+            selected_every = st.session_state.get(f"panel6_every_{file_name}", 3)
+            selected_azim = st.session_state.get(f"panel6_azim_{file_name}", 45)
+            selected_elev = st.session_state.get(f"panel6_elev_{file_name}", 25)
+            selected_smooth = st.session_state.get(f"panel6_smooth_{file_name}", True)
+            selected_smooth_window = st.session_state.get(f"panel6_smooth_window_{file_name}", 5)
+
+            fig_mpl = panel6_obj.plot_matplotlib_3d(
+                azim=selected_azim,
+                elev=selected_elev,
+                plot_mode=selected_mode,
+                time_start=selected_range[0],
+                time_end=selected_range[1],
+                show_every_nth=selected_every,
+                smooth=selected_smooth,
+                smooth_window=selected_smooth_window
             )
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                config={"displayModeBar": True}
-            )
 
-            file_name = os.path.splitext(os.path.basename(data_path))[0]
+            st.pyplot(fig_mpl, clear_figure=False)
 
-            fig_mpl = st.session_state["panel_6_obj"].plot_matplotlib(
-                spacing=spacing,
-                show_fit=show_fit,
-                show_every_nth=show_every_nth
-            )
+            approx_peaks = panel6_obj.validate_peak_positions()
+            if approx_peaks:
+                st.caption(
+                    f"Approximate major peak positions across time (ppm): "
+                    f"min={approx_peaks[0]:.2f}, median={approx_peaks[1]:.2f}, max={approx_peaks[2]:.2f}"
+                )
 
-            export_format = st.selectbox(
-                "Choose export format",
-                options=["PDF", "PNG", "JPG"],
-                index=0,
-                key=f"panel6_export_format_{file_name}_{show_fit}_{show_every_nth}_{spacing_factor}"
-            )
-
-            self.save_plot_with_format(
-                session_obj=st.session_state["panel_6_obj"],
+            self.save_matplotlib_formats(
+                session_obj=panel6_obj,
                 fig=fig_mpl,
                 file_basename=file_name,
-                file_name=f"Stacked_Spectra_{file_name}",
-                button_key=f"panel6_{file_name}_{show_fit}_{show_every_nth}_{spacing_factor}",
-                selected_format=export_format
+                file_name=(
+                    f"Waterfall_{file_name}_"
+                    f"{selected_mode.replace(' ', '_').replace('+', 'plus')}_"
+                    f"{selected_range[0]}to{selected_range[1]}_"
+                    f"azim{selected_azim}_elev{selected_elev}"
+                ),
+                button_key=(
+                    f"panel6_{file_name}_{selected_mode}_"
+                    f"{selected_range[0]}_{selected_range[1]}_"
+                    f"{selected_every}_{selected_azim}_{selected_elev}_"
+                    f"{selected_smooth}_{selected_smooth_window}"
+                )
+            )
+
+    def about_page(self, about):
+        with about:
+            st.markdown(
+                """
+                ### Instructions:
+
+                #### Step 0:
+                **Choose the Model:**
+
+                **Model 1:**
+                Lorenzian curve fitting with parameters of the Meta Description
+
+                **Model 2:**
+                Lorenzian curve fitting + initial parameters derived from actual spectrum
+
+                #### Step 1:
+                - **Select the Metadata**
+                - **Select the Substrate**
+                - **Select the Reference File**
+
+                #### Step 2:
+                - Click Start Processing
+
+                #### Step 3:
+                ##### Substrate Plot
+                - Use sliders to select the frame
+                - Use the legend to show or hide lines
+                - Select export format before saving
+
+                #### Kinetic Plot
+                - Kinetics of metabolites and substrate peaks
+                - Select export format before saving
+
+                #### Contour Plot
+                - Visualize the full measured spectrum and select the depth [%]
+                - Select export format before saving
+
+                #### Stacked Spectra Plot
+                - Visualize multiple spectra stacked vertically
+                - Adjust frame range and spacing
+                - Select export format before saving
+
+                #### Peak Chunks Plot (Panel 7)
+                - View each merged metadata chunk in a zoomed spectrum plot
+                - Read chunk ppm boundaries in the table below the plots
+
+                #### Reference Plot
+                - Get the reference value on water
+                - Select export format before saving
+                """
             )
 
     def run(self):
         self.header()
 
 
-print("Layout.py wurde geladen")
+print("Layout.py loaded")
 print("StreamlitApp:", "StreamlitApp" in dir())
