@@ -936,11 +936,11 @@ class StreamlitApp:
                 show_panel2 = st.checkbox("Show Panel 2 - Kinetic Plot", value=True, key="show_panel2")
                 show_panel3 = st.checkbox("Show Panel 3 - Contour Plot", value=False, key="show_panel3")
                 show_panel4 = st.checkbox("Show Panel 4 - Reference Plot", value=False, key="show_panel4")
-                show_panel6 = st.checkbox("Show Panel 6 - Waterfall Plot", value=False, key="show_panel6")
-                show_panel7 = st.checkbox(
-                    "Show Panel 7 - Peak Fitting Chunks",
+                show_panel5 = st.checkbox("Show Panel 5 - Waterfall Plot", value=False, key="show_panel5")
+                show_panel6 = st.checkbox(
+                    "Show Panel 6 - Peak Fitting Chunks",
                     value=True,
-                    key="show_panel7",
+                    key="show_panel6",
                 )
 
                 if show_panel1:
@@ -949,12 +949,12 @@ class StreamlitApp:
                     self.panel2()
                 if show_panel3:
                     self.panel3()
-                if show_panel7:
-                    self.panel7()
                 if show_panel4:
                     self.panel4()
-                if show_panel6:
+                if show_panel5:
                     self.panel6()
+                if show_panel6:
+                    self.panel7()
 
                 st.markdown("---")
                 st.markdown("### Download Results")
@@ -1255,6 +1255,16 @@ class StreamlitApp:
             st.warning(f"Could not load chunk panel: {e}")
             st.session_state["panel_7_obj"] = None
 
+    @staticmethod
+    def _apply_slider_value(source_key, target_key, min_value, max_value):
+        """Copy the current widget value into the applied value during the button callback."""
+        value = st.session_state.get(source_key, min_value)
+        try:
+            value = int(value)
+        except Exception:
+            value = min_value
+        st.session_state[target_key] = min(max(value, min_value), max_value)
+
     def panel1(self):
         tmp_data_path = st.session_state.get("tmp_data_path")
 
@@ -1279,19 +1289,40 @@ class StreamlitApp:
                 st.info("Panel 1: No time frames found.")
                 return
 
+            applied_key = f"panel1_applied_frame_{file_name}"
+            pending_key = f"panel1_pending_frame_{file_name}"
+
+            if applied_key not in st.session_state:
+                st.session_state[applied_key] = 1
+
+            st.session_state[applied_key] = min(
+                max(int(st.session_state.get(applied_key, 1)), 1),
+                n_frames_data,
+            )
+
+            if pending_key not in st.session_state:
+                st.session_state[pending_key] = st.session_state[applied_key]
+            else:
+                st.session_state[pending_key] = min(
+                    max(int(st.session_state.get(pending_key, st.session_state[applied_key])), 1),
+                    n_frames_data,
+                )
+
             with st.form(f"panel1_form_{file_name}"):
-                time_frame = st.slider(
+                st.slider(
                     "Select the frame",
                     min_value=1,
                     max_value=n_frames_data,
-                    value=st.session_state.get(f"panel1_frame_{file_name}", 1),
+                    key=pending_key,
                 )
-                apply_panel1 = st.form_submit_button("Apply Panel 1 Settings")
+                st.form_submit_button(
+                    "Apply Panel 1 Settings",
+                    on_click=self._apply_slider_value,
+                    args=(pending_key, applied_key, 1, n_frames_data),
+                )
 
-            if apply_panel1 or f"panel1_frame_{file_name}" not in st.session_state:
-                st.session_state[f"panel1_frame_{file_name}"] = time_frame
-
-            selected_frame = st.session_state.get(f"panel1_frame_{file_name}", 1)
+            selected_frame = int(st.session_state.get(applied_key, 1))
+            selected_frame = min(max(selected_frame, 1), n_frames_data)
 
             st.markdown("# Substrate Plot")
 
@@ -1316,7 +1347,6 @@ class StreamlitApp:
                 file_name=f"Substrate_{file_name}_{selected_frame}",
                 button_key=f"panel1_{file_name}_{selected_frame}"
             )
-
 
     def panel2(self):
         tmp_data_path = st.session_state.get("tmp_data_path")
@@ -1597,42 +1627,79 @@ class StreamlitApp:
         data_path = st.session_state.get("tmp_data_path")
 
         if "panel_6_obj" not in st.session_state or st.session_state["panel_6_obj"] is None:
-            st.error("Panel 6 object not initialized. Please process data first.")
+            st.error("Panel 5 object not initialized. Please process data first.")
             return
 
         file_name = os.path.splitext(os.path.basename(data_path))[0]
         panel6_obj = st.session_state["panel_6_obj"]
         max_timepoints = panel6_obj.n_timepoints
 
-        with st.expander("Panel 6 - Waterfall Plot", expanded=True):
+        with st.expander("Panel 5 - Waterfall Plot", expanded=True):
             st.markdown("# Waterfall Plot")
 
-            with st.form(f"panel6_form_{file_name}"):
+            modes = ["Raw only", "Fitted only", "Raw + fitted", "Diff only"]
 
+            applied_defaults = {
+                "mode": "Raw + fitted",
+                "time_range": (1, min(max_timepoints, 50)),
+                "every": 3,
+                "azim": 45,
+                "elev": 25,
+                "smooth": True,
+                "smooth_window": 5,
+            }
+
+            applied_keys = {
+                "mode": f"panel6_applied_mode_{file_name}",
+                "time_range": f"panel6_applied_time_range_{file_name}",
+                "every": f"panel6_applied_every_{file_name}",
+                "azim": f"panel6_applied_azim_{file_name}",
+                "elev": f"panel6_applied_elev_{file_name}",
+                "smooth": f"panel6_applied_smooth_{file_name}",
+                "smooth_window": f"panel6_applied_smooth_window_{file_name}",
+            }
+
+            pending_keys = {
+                "mode": f"panel6_pending_mode_{file_name}",
+                "time_range": f"panel6_pending_time_range_{file_name}",
+                "every": f"panel6_pending_every_{file_name}",
+                "azim": f"panel6_pending_azim_{file_name}",
+                "elev": f"panel6_pending_elev_{file_name}",
+                "smooth": f"panel6_pending_smooth_{file_name}",
+                "smooth_window": f"panel6_pending_smooth_window_{file_name}",
+            }
+
+            # Initialize applied values once per file.
+            for name, key in applied_keys.items():
+                if key not in st.session_state:
+                    st.session_state[key] = applied_defaults[name]
+
+            # Clamp values if a different dataset has fewer timepoints.
+            start, end = st.session_state[applied_keys["time_range"]]
+            start = min(max(int(start), 1), max_timepoints)
+            end = min(max(int(end), start), max_timepoints)
+            st.session_state[applied_keys["time_range"]] = (start, end)
+
+            # Initialize pending values from applied values.
+            for name, pkey in pending_keys.items():
+                if pkey not in st.session_state:
+                    st.session_state[pkey] = st.session_state[applied_keys[name]]
+
+            with st.form(f"panel6_form_{file_name}"):
                 plot_mode = st.selectbox(
                     "Select waterfall display mode",
-                    options=[
-                        "Raw only",
-                        "Fitted only",
-                        "Raw + fitted",
-                        "Diff only"
-                    ],
-                    index=[
-                        "Raw only",
-                        "Fitted only",
-                        "Raw + fitted",
-                        "Diff only"
-                    ].index(st.session_state.get(f"panel6_mode_{file_name}", "Raw + fitted"))
+                    options=modes,
+                    index=modes.index(st.session_state[pending_keys["mode"]])
+                    if st.session_state[pending_keys["mode"]] in modes else 2,
+                    key=pending_keys["mode"],
                 )
 
                 time_range = st.slider(
                     "Select spectra/time-point range",
                     min_value=1,
                     max_value=max_timepoints,
-                    value=st.session_state.get(
-                        f"panel6_time_range_{file_name}",
-                        (1, min(max_timepoints, 50))
-                    )
+                    value=st.session_state[pending_keys["time_range"]],
+                    key=pending_keys["time_range"],
                 )
 
                 col1, col2, col3, col4 = st.columns(4)
@@ -1642,7 +1709,8 @@ class StreamlitApp:
                         "Show every n-th timepoint",
                         1,
                         10,
-                        st.session_state.get(f"panel6_every_{file_name}", 3)
+                        value=int(st.session_state[pending_keys["every"]]),
+                        key=pending_keys["every"],
                     )
 
                 with col2:
@@ -1650,8 +1718,9 @@ class StreamlitApp:
                         "Horizontal angle (°)",
                         min_value=0,
                         max_value=360,
-                        value=st.session_state.get(f"panel6_azim_{file_name}", 45),
-                        step=5
+                        value=int(st.session_state[pending_keys["azim"]]),
+                        step=5,
+                        key=pending_keys["azim"],
                     )
 
                 with col3:
@@ -1659,43 +1728,46 @@ class StreamlitApp:
                         "Vertical angle (°)",
                         min_value=5,
                         max_value=90,
-                        value=st.session_state.get(f"panel6_elev_{file_name}", 25),
-                        step=5
+                        value=int(st.session_state[pending_keys["elev"]]),
+                        step=5,
+                        key=pending_keys["elev"],
                     )
 
                 with col4:
                     smooth = st.checkbox(
                         "Apply smoothing",
-                        value=st.session_state.get(f"panel6_smooth_{file_name}", True)
+                        value=bool(st.session_state[pending_keys["smooth"]]),
+                        key=pending_keys["smooth"],
                     )
 
                 smooth_window = st.slider(
                     "Smoothing window",
                     3,
                     15,
-                    st.session_state.get(f"panel6_smooth_window_{file_name}", 5),
-                    step=2
+                    value=int(st.session_state[pending_keys["smooth_window"]]),
+                    step=2,
+                    key=pending_keys["smooth_window"],
                 )
 
                 apply_panel6 = st.form_submit_button("Apply Waterfall Settings")
 
-            if apply_panel6 or f"panel6_ready_{file_name}" not in st.session_state:
-                st.session_state[f"panel6_mode_{file_name}"] = plot_mode
-                st.session_state[f"panel6_time_range_{file_name}"] = time_range
-                st.session_state[f"panel6_every_{file_name}"] = show_every_nth
-                st.session_state[f"panel6_azim_{file_name}"] = azim
-                st.session_state[f"panel6_elev_{file_name}"] = elev
-                st.session_state[f"panel6_smooth_{file_name}"] = smooth
-                st.session_state[f"panel6_smooth_window_{file_name}"] = smooth_window
-                st.session_state[f"panel6_ready_{file_name}"] = True
+            if apply_panel6:
+                # Use freshly submitted form values immediately.
+                st.session_state[applied_keys["mode"]] = plot_mode
+                st.session_state[applied_keys["time_range"]] = time_range
+                st.session_state[applied_keys["every"]] = int(show_every_nth)
+                st.session_state[applied_keys["azim"]] = int(azim)
+                st.session_state[applied_keys["elev"]] = int(elev)
+                st.session_state[applied_keys["smooth"]] = bool(smooth)
+                st.session_state[applied_keys["smooth_window"]] = int(smooth_window)
 
-            selected_mode = st.session_state.get(f"panel6_mode_{file_name}", "Raw + fitted")
-            selected_range = st.session_state.get(f"panel6_time_range_{file_name}", (1, min(max_timepoints, 50)))
-            selected_every = st.session_state.get(f"panel6_every_{file_name}", 3)
-            selected_azim = st.session_state.get(f"panel6_azim_{file_name}", 45)
-            selected_elev = st.session_state.get(f"panel6_elev_{file_name}", 25)
-            selected_smooth = st.session_state.get(f"panel6_smooth_{file_name}", True)
-            selected_smooth_window = st.session_state.get(f"panel6_smooth_window_{file_name}", 5)
+            selected_mode = st.session_state[applied_keys["mode"]]
+            selected_range = st.session_state[applied_keys["time_range"]]
+            selected_every = st.session_state[applied_keys["every"]]
+            selected_azim = st.session_state[applied_keys["azim"]]
+            selected_elev = st.session_state[applied_keys["elev"]]
+            selected_smooth = st.session_state[applied_keys["smooth"]]
+            selected_smooth_window = st.session_state[applied_keys["smooth_window"]]
 
             fig_mpl = panel6_obj.plot_matplotlib_3d(
                 azim=selected_azim,
