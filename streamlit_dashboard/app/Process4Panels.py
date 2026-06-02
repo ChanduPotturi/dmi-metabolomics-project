@@ -10,9 +10,10 @@ class Process4Panels:
 
     This class reconstructs and prepares all data products required for the
     multi-panel visualization (Panel 1–4 and Panel 6) in the Streamlit app.
-    It loads the raw spectral data and the previously generated fitting 
-    parameters, rebuilds fitted spectra, derives additional analysis outputs,
-    and stores them in the standard output directory structure.
+    It loads the raw spectral data and uses fitting parameters provided in
+    memory when available, rebuilds fitted spectra, derives additional
+    analysis outputs, and stores them in the standard output directory
+    structure.
 
     The class produces the following files:
 
@@ -45,14 +46,14 @@ class Process4Panels:
 
     Notes:
         – The class automatically normalizes decimal formats and removes invalid rows.
-        – All reconstructed spectra use the Lorentzian parameters output by 
+        – All reconstructed spectra use the Lorentzian parameters output by
           the PeakFitting class.
         – The plotting itself is not handled here; this class only generates 
           the required numeric data for the visual layers.
 
     """
 
-    def __init__(self, data_file_path):
+    def __init__(self, data_file_path, fitting_params=None, fitting_params_error=None):
         # prepare file paths
         self.data_file_path = data_file_path
         #self.file_name = os.path.basename(data_file_path)
@@ -82,8 +83,12 @@ class Process4Panels:
         shift_col = self.data.columns[0]
         self.data = self.data.rename(columns={shift_col: "chemical_shift_ppm"})
 
-        self.fitting_params = pd.read_csv(self.fitting_params_fp)
-        self.fitting_params_error = pd.read_csv(self.fitting_params_err_fp)
+        if fitting_params is not None and fitting_params_error is not None:
+            self.fitting_params = fitting_params.copy()
+            self.fitting_params_error = fitting_params_error.copy()
+        else:
+            self.fitting_params = pd.read_csv(self.fitting_params_fp)
+            self.fitting_params_error = pd.read_csv(self.fitting_params_err_fp)
 
     def lorentzian(self, x, shift, gamma, A, y_shift):
         """
@@ -109,11 +114,11 @@ class Process4Panels:
         x = self.data.iloc[:,0]
         self.sum_df = pd.DataFrame({'x': x})
         for i, row in enumerate(self.fitting_params.iterrows()):
-            n_peaks = int((len(row[1]) - 2) / 3)
-            y_shift = row[1].iloc[1]
-            positions = row[1][2:n_peaks+2]
-            widths = row[1][2+n_peaks: 2*n_peaks+2]
-            amplitudes = row[1][2*n_peaks+2:]
+            n_peaks = int((len(row[1]) - 1) / 3)
+            y_shift = row[1].iloc[0]
+            positions = row[1].iloc[1 : n_peaks + 1]
+            widths = row[1].iloc[n_peaks + 1 : 2 * n_peaks + 1]
+            amplitudes = row[1].iloc[2 * n_peaks + 1 :]
             y = np.zeros(len(x))
             for position,width, amplitude in zip(positions, widths, amplitudes):
                 y += self.lorentzian(x, position, width, amplitude, y_shift)
@@ -132,12 +137,12 @@ class Process4Panels:
         os.makedirs(str(output_path), exist_ok=True)
 
         for i, row in enumerate(self.fitting_params.iterrows()):
-            n_peaks = int((len(row[1]) - 2) / 3)
-            names = row[1].index[2:]  # This remains the same because `index` is used for column labels
-            y_shift = row[1].iloc[1]
-            positions = row[1].iloc[2:n_peaks + 2]
-            widths = row[1].iloc[2 + n_peaks: 2 * n_peaks + 2]
-            amplitudes = row[1].iloc[2 * n_peaks + 2:]
+            n_peaks = int((len(row[1]) - 1) / 3)
+            names = row[1].index[1:]
+            y_shift = row[1].iloc[0]
+            positions = row[1].iloc[1 : n_peaks + 1]
+            widths = row[1].iloc[n_peaks + 1 : 2 * n_peaks + 1]
+            amplitudes = row[1].iloc[2 * n_peaks + 1 :]
             time_frame_res = pd.DataFrame({'x': x})
             
             # group positons according to substances
@@ -178,12 +183,12 @@ class Process4Panels:
             return A * gamma / ((x - shift)**2 + gamma**2)
 
         for i, row in enumerate(self.fitting_params.iterrows()):
-            n_peaks = int((len(row[1]) - 2) / 3)
-            names = row[1].index[2:]   # Peak-Namen
-            y_shift = row[1].iloc[1]
-            positions = row[1].iloc[2:n_peaks + 2]
-            widths    = row[1].iloc[2 + n_peaks: 2 * n_peaks + 2]
-            amplitudes= row[1].iloc[2 * n_peaks + 2:]
+            n_peaks = int((len(row[1]) - 1) / 3)
+            names = row[1].index[1:]
+            y_shift = row[1].iloc[0]
+            positions = row[1].iloc[1 : n_peaks + 1]
+            widths = row[1].iloc[n_peaks + 1 : 2 * n_peaks + 1]
+            amplitudes = row[1].iloc[2 * n_peaks + 1 :]
 
             time_frame_res = pd.DataFrame({'x': x})
 
@@ -286,8 +291,8 @@ class Process4Panels:
               so amplitudes are used as a proxy here.
             - Peaks are grouped by their substance name prefix (before '_').
         """
-        n_peaks = self.fitting_params.shape[1] // 3
-        names = self.fitting_params.columns[2:] 
+        n_peaks = (self.fitting_params.shape[1] - 1) // 3
+        names = self.fitting_params.columns[1:]
 
         substances = list(set([name.split('_')[0] for name in names]))
 
@@ -295,7 +300,7 @@ class Process4Panels:
 
         # the integral is approximated by the amplitude
         for i, row in enumerate(self.fitting_params.iterrows()):
-            amplitudes = row[1].iloc[2 * n_peaks + 2:]
+            amplitudes = row[1].iloc[2 * n_peaks + 1 :]
             # group positons according to substances, unnecessary loop. complete waste of computational resources
             for k, substance in enumerate(substances):
                 indices = []
