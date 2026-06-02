@@ -45,7 +45,7 @@ class Reference():
         self.data = pd.read_csv(fp_ref)
         self.chem_shifts = self.data.iloc[:,0]
         self.LorentzianFit = peak_fitting_v6.PeakFitting(fp_file = fp_ref , fp_meta = fp_meta)
-        self.fitting_params = self.LorentzianFit.fit(save_csv= False)
+        self.fitting_params = self.LorentzianFit.fit()
         self.reference_value = self.ReferenceValue()
         #self.file_name_ref = os.path.basename(fp_ref)
         self.file_name_ref = os.path.splitext(os.path.basename(fp_ref))[0]
