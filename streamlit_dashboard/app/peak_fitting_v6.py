@@ -359,13 +359,13 @@ class PeakFitting:
     def fit(self, save_csv = True):
         """
         Fit the data with the grey spectrum. The fitting is done in two steps. First, the whole spectrum is fitted with shared parameters. Second, the parameters are fine tuned.
-        The fitting parameters and errors are saved as csv files.
+        The fitting parameters and errors are kept in memory.
 
         Args:
-            save_csv: bool, if True, the results are saved as csv files
-        
+            None
+
         Returns:
-            fitting_params: dataframe of the fitting parameters if save_csv is False
+            fitting_params: dataframe of the fitting parameters
         """
 
         # bounds for the first fitting, which corresponds to the first frame
@@ -420,12 +420,7 @@ class PeakFitting:
         self.fitting_params.fillna(0, inplace=True)
         self.fitting_params_error.fillna(0,inplace=True)
 
-        # save results
-        if save_csv == True:
-            self.fitting_params.to_csv(self.output_direc + 'fitting_params.csv')
-            self.fitting_params_error.to_csv(self.output_direc + 'fitting_params_error.csv')
-        else:
-            return self.fitting_params
+        return self.fitting_params
 
     
     def lorentzian(self, x, shift, gamma, A):
@@ -474,13 +469,6 @@ class PeakFitting:
         # stop code from execution
         return y
     
-    def write_results(self):
-        '''
-        Save the fitting parameters and errors as csv files.
-        '''
-        self.fitting_params.to_csv(os.path.join(self.output_direc, 'fitting_params.csv'))
-        self.fitting_params_error.to_csv(os.path.join(self.output_direc, 'fitting_params_error.csv'))
-
     # this has high potential for being wrong
     def grey_spectrum_fine_tune(self, x, *params):
         '''

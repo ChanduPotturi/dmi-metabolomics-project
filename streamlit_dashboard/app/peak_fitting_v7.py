@@ -57,17 +57,12 @@ class PeakFitting:
 
     Output
     ------
-    The class writes two CSV files into:
+    The fitted parameters are kept in memory as pandas DataFrames:
 
-        <tmpdir>/<filename>_output/
+        • fitting_params
+        • fitting_params_error
 
-    containing:
-        • fitting_params.csv  
-            └ y_shift, positions, widths, amplitudes per peak and time step  
-        • fitting_params_error.csv  
-            └ corresponding parameter uncertainties
-
-    These files are consumed by downstream components such as:
+    These are consumed by downstream components such as:
         • Process4Panels (panel preprocessing)
         • KineticPlot (panel 2)
         • ContourPlot (panel 3)
@@ -80,7 +75,6 @@ class PeakFitting:
     • No coarse global shift fit step — fitting starts directly from prefitted peak centers  
     • `self.positions` is now a 2D structure (one list per time frame)  
     • Improved NaN/inf cleaning before fitting  
-    • Output directory moved to system temp folder  
     • Simplified bounds system for improved stability  
     • More robust handling of malformed CSV input  
 
@@ -114,9 +108,8 @@ class PeakFitting:
         self.file_name = os.path.basename(fp_file)
         self.meta_name = os.path.basename(fp_meta)
 
-        # define and create output directory
+        # define output directory attribute (do not write files here)
         self.output_direc = os.path.join(tempfile.gettempdir(), self.file_name + '_output')
-        os.makedirs(self.output_direc, exist_ok=True)
 
         # load the spectral file
         self.df = pd.read_csv(fp_file, sep=None, engine="python", on_bad_lines="skip")
@@ -343,15 +336,12 @@ class PeakFitting:
         return np.concatenate([np.array([popt[0]]), popt[1:self.number_peaks+1], widths_final, amplitudes_final]), \
             np.concatenate([np.array([error[0]]), error[1:self.number_peaks+1], widths_final_error, amplitudes_final_error])
 
-    def fit(self, save_csv = True):
+    def fit(self):
         """
-        Fit the data with the grey spectrum. The fitting parameters and errors are saved as csv files.
+        Fit the data with the grey spectrum and keep the results in memory.
 
-        Args:
-            save_csv: bool, if True, the results are saved as csv files
-        
         Returns:
-            fitting_params: dataframe of the fitting parameters if save_csv is False
+            fitting_params: dataframe of the fitting parameters
         """
         progress_bar = st.empty()
         load_bar = progress_bar.progress(0)
@@ -394,12 +384,22 @@ class PeakFitting:
         self.fitting_params.fillna(0, inplace=True)
         self.fitting_params_error.fillna(0,inplace=True)
 
-        # save results
-        if save_csv == True:
-            self.fitting_params.to_csv(self.output_direc + 'fitting_params.csv')
-            self.fitting_params_error.to_csv(self.output_direc + 'fitting_params_error.csv')
-        else:
-            return self.fitting_params
+        return self.fitting_params
+
+    def zip_results(self) -> bytes:
+        """Return an in-memory ZIP archive (bytes) containing the fitting results CSVs.
+
+        The CSVs are generated from `self.fitting_params` and `self.fitting_params_error`
+        without writing them to disk.
+        """
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            csv1 = self.fitting_params.to_csv(index=True)
+            zf.writestr("fitting_params.csv", csv1)
+            csv2 = self.fitting_params_error.to_csv(index=True)
+            zf.writestr("fitting_params_error.csv", csv2)
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
 
     
     def lorentzian(self, x, shift, gamma, A):
@@ -448,13 +448,6 @@ class PeakFitting:
         # stop code from execution
         return y
     
-    def write_results(self):
-        '''
-        Save the fitting parameters and errors as csv files.
-        '''
-        self.fitting_params.to_csv(self.output_direc + 'fitting_params.csv')
-        self.fitting_params_error.to_csv(self.output_direc + 'fitting_params_error.csv')
-
     # this has high potential for being wrong
     def grey_spectrum_fine_tune(self, x, *params):
         '''
@@ -483,18 +476,3 @@ class PeakFitting:
                 y += self.lorentzian(x, x0[i], gamma[k], A[k]) + y_shift
         return y
 
-    def zip_output_directory(output_dir_path):
-        """
-        Zips all files in the given output directory and returns the in-memory zip file as BytesIO.
-        """
-        zip_buffer = io.BytesIO()
-
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-            for root, _, files in os.walk(output_dir_path):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, output_dir_path)  # relative name inside the zip
-                    zip_file.write(file_path, arcname)
-
-        zip_buffer.seek(0)
-        return zip_buffer

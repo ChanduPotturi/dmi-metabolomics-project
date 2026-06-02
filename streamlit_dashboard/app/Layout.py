@@ -202,11 +202,12 @@ def run_processing_cached(
     t_fit = time.perf_counter()
 
     file_basename = os.path.splitext(os.path.basename(data_path))[0]
-    os.makedirs(fitter.output_direc, exist_ok=True)
-    fitter.fitting_params.to_csv(os.path.join(fitter.output_direc, "fitting_params.csv"))
-    fitter.fitting_params_error.to_csv(os.path.join(fitter.output_direc, "fitting_params_error.csv"))
 
-    processor = Process4Panels(data_path)
+    processor = Process4Panels(
+        data_path,
+        fitting_params=fitter.fitting_params,
+        fitting_params_error=fitter.fitting_params_error,
+    )
     processor.save_sum_spectra()
     processor.save_substrate_individual()
     processor.save_individual_peaks()
