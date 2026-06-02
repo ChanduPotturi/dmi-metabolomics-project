@@ -1240,7 +1240,10 @@ class StreamlitApp:
                 )
                 st.success("Reference processing completed. Results available in mmol.")
             except Exception as e:
+                import traceback
                 st.error(f"Error processing reference: {str(e)}")
+                with st.expander("Reference processing traceback"):
+                    st.code(traceback.format_exc())
                 st.session_state["panel_4_obj"] = None
         else:
             st.session_state["panel_4_obj"] = None
@@ -1632,7 +1635,7 @@ class StreamlitApp:
 
         file_name = os.path.splitext(os.path.basename(data_path))[0]
         panel6_obj = st.session_state["panel_6_obj"]
-        max_timepoints = panel6_obj.n_timepoints
+        max_timepoints = int(panel6_obj.n_timepoints)
 
         with st.expander("Panel 5 - Waterfall Plot", expanded=True):
             st.markdown("# Waterfall Plot")
@@ -1659,47 +1662,42 @@ class StreamlitApp:
                 "smooth_window": f"panel6_applied_smooth_window_{file_name}",
             }
 
-            pending_keys = {
-                "mode": f"panel6_pending_mode_{file_name}",
-                "time_range": f"panel6_pending_time_range_{file_name}",
-                "every": f"panel6_pending_every_{file_name}",
-                "azim": f"panel6_pending_azim_{file_name}",
-                "elev": f"panel6_pending_elev_{file_name}",
-                "smooth": f"panel6_pending_smooth_{file_name}",
-                "smooth_window": f"panel6_pending_smooth_window_{file_name}",
-            }
-
-            # Initialize applied values once per file.
+            # Initialize only the applied values. Do not pre-set widget keys.
+            # This avoids Streamlit warnings about setting widget keys through Session State.
             for name, key in applied_keys.items():
                 if key not in st.session_state:
                     st.session_state[key] = applied_defaults[name]
 
-            # Clamp values if a different dataset has fewer timepoints.
+            # Clamp applied values if another dataset has fewer timepoints.
             start, end = st.session_state[applied_keys["time_range"]]
             start = min(max(int(start), 1), max_timepoints)
             end = min(max(int(end), start), max_timepoints)
             st.session_state[applied_keys["time_range"]] = (start, end)
 
-            # Initialize pending values from applied values.
-            for name, pkey in pending_keys.items():
-                if pkey not in st.session_state:
-                    st.session_state[pkey] = st.session_state[applied_keys[name]]
+            current_mode = st.session_state[applied_keys["mode"]]
+            current_range = st.session_state[applied_keys["time_range"]]
+            current_every = min(max(int(st.session_state[applied_keys["every"]]), 1), 10)
+            current_azim = min(max(int(st.session_state[applied_keys["azim"]]), 0), 360)
+            current_elev = min(max(int(st.session_state[applied_keys["elev"]]), 5), 90)
+            current_smooth = bool(st.session_state[applied_keys["smooth"]])
+            current_smooth_window = int(st.session_state[applied_keys["smooth_window"]])
+            if current_smooth_window not in [3, 5, 7, 9, 11, 13, 15]:
+                current_smooth_window = 5
 
             with st.form(f"panel6_form_{file_name}"):
                 plot_mode = st.selectbox(
                     "Select waterfall display mode",
                     options=modes,
-                    index=modes.index(st.session_state[pending_keys["mode"]])
-                    if st.session_state[pending_keys["mode"]] in modes else 2,
-                    key=pending_keys["mode"],
+                    index=modes.index(current_mode) if current_mode in modes else 2,
+                    key=f"panel6_form_mode_{file_name}",
                 )
 
                 time_range = st.slider(
                     "Select spectra/time-point range",
                     min_value=1,
                     max_value=max_timepoints,
-                    value=st.session_state[pending_keys["time_range"]],
-                    key=pending_keys["time_range"],
+                    value=current_range,
+                    key=f"panel6_form_time_range_{file_name}",
                 )
 
                 col1, col2, col3, col4 = st.columns(4)
@@ -1709,8 +1707,8 @@ class StreamlitApp:
                         "Show every n-th timepoint",
                         1,
                         10,
-                        value=int(st.session_state[pending_keys["every"]]),
-                        key=pending_keys["every"],
+                        value=current_every,
+                        key=f"panel6_form_every_{file_name}",
                     )
 
                 with col2:
@@ -1718,9 +1716,9 @@ class StreamlitApp:
                         "Horizontal angle (°)",
                         min_value=0,
                         max_value=360,
-                        value=int(st.session_state[pending_keys["azim"]]),
+                        value=current_azim,
                         step=5,
-                        key=pending_keys["azim"],
+                        key=f"panel6_form_azim_{file_name}",
                     )
 
                 with col3:
@@ -1728,31 +1726,31 @@ class StreamlitApp:
                         "Vertical angle (°)",
                         min_value=5,
                         max_value=90,
-                        value=int(st.session_state[pending_keys["elev"]]),
+                        value=current_elev,
                         step=5,
-                        key=pending_keys["elev"],
+                        key=f"panel6_form_elev_{file_name}",
                     )
 
                 with col4:
                     smooth = st.checkbox(
                         "Apply smoothing",
-                        value=bool(st.session_state[pending_keys["smooth"]]),
-                        key=pending_keys["smooth"],
+                        value=current_smooth,
+                        key=f"panel6_form_smooth_{file_name}",
                     )
 
                 smooth_window = st.slider(
                     "Smoothing window",
                     3,
                     15,
-                    value=int(st.session_state[pending_keys["smooth_window"]]),
+                    value=current_smooth_window,
                     step=2,
-                    key=pending_keys["smooth_window"],
+                    key=f"panel6_form_smooth_window_{file_name}",
                 )
 
                 apply_panel6 = st.form_submit_button("Apply Waterfall Settings")
 
             if apply_panel6:
-                # Use freshly submitted form values immediately.
+                # Apply the freshly submitted form values immediately.
                 st.session_state[applied_keys["mode"]] = plot_mode
                 st.session_state[applied_keys["time_range"]] = time_range
                 st.session_state[applied_keys["every"]] = int(show_every_nth)
