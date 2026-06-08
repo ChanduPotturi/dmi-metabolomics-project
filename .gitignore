@@ -211,3 +211,6 @@ streamlit_dashboard/app/results.zip
 streamlit_dashboard/app/runtime_uploads/
 
 streamlit_dashboard/app/output/
+
+output/
+runtime_uploads/
