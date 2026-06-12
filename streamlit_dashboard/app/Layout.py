@@ -57,10 +57,10 @@ def process_to_dataframe(pdata_path: Path) -> pd.DataFrame:
 
     # Keep only active spectra columns and match the notebook downsampling behavior.
     spectra = df.iloc[:, 1:]
-    mask = spectra.abs().max(axis=0) > 1e6
+    mask = spectra.abs().max(axis=0) != 0
     df = pd.concat([df["ppm"], spectra.loc[:, mask]], axis=1)
-    df = df.iloc[1::2, :].reset_index(drop=True)
 
+    # Downsample by the same factor as in the notebook to keep similar performance characteristics
     scale_factor = 32000
     df.loc[:, df.columns != "ppm"] = df.loc[:, df.columns != "ppm"] / scale_factor
 
